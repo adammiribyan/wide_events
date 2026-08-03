@@ -84,7 +84,7 @@ module SetWideEventContext
 
       WideEvent.set(
         "user.id" => Current.person&.id,
-        "user.type" => Current.person.class.name,
+        "user.type" => Current.person&.class&.name,
         "user.account.id" => Current.account&.id,
         # Client input, so cap the length.
         "session.id" => request.headers["X-POSTHOG-SESSION-ID"].presence&.first(64)
@@ -95,7 +95,7 @@ end
 
 The real concern also stamps `user.impersonated` and
 `user.impersonated_by` when an admin is acting as someone else, so
-support sessions never pollute per-user analysis.
+support sessions can be excluded from per-user analysis.
 
 **Feature flags at evaluation time.** The app wraps its flag SDK in one
 helper, so every evaluation lands on the event and any symptom can be
@@ -139,9 +139,10 @@ They exist so the similarity cutoffs can be recalibrated against live
 traffic instead of guesses: the app's cosine floors were set by querying
 these attributes, not by tuning in development.
 
-**LLM generations: tokens, latency, cost; content never.** Every
-generation records its telemetry on whichever request or job triggered
-it, on both terminal transitions (completed and failed):
+**LLM generation telemetry: tokens, latency, cost; content never.** In this
+app, each request or job represented here performs at most one generation.
+That generation records telemetry for both terminal outcomes (completed and
+failed):
 
 ```ruby
 def record_generation_telemetry(model:, input_tokens:, output_tokens:, latency:, error: nil, expected: nil)
@@ -173,8 +174,8 @@ failing uploads show up in the same table as everything else.
 ## Standing queries
 
 Two queries from that deployment worth adopting on day one. First, the
-uninstrumented-failure to-do list: every row is an exception nobody
-wrote a rescue for, in priority order (the
+unnamed-exception investigation queue: every row is an exception that escaped
+without a named handled failure, in priority order (the
 [cookbook](clickhouse-hyperdx.md) has the full version):
 
 ```sql
@@ -185,16 +186,18 @@ FROM otel_traces
 WHERE SpanAttributes['main'] = 'true'
   AND SpanAttributes['error'] = 'true'
   AND SpanAttributes['exception.slug'] = ''
+  AND SpanAttributes['exception.type'] != ''
 GROUP BY type, controller ORDER BY occurrences DESC
 ```
 
-Second, LLM cost and reliability per model and kind, computed from
-request and job rows alone, no separate LLM observability pipeline:
+Second, LLM cost and reliability per model and kind, computed from request and
+job rows where each row represents at most one generation—no separate LLM
+observability pipeline required:
 
 ```sql
 SELECT SpanAttributes['assist.model'] AS model,
        SpanAttributes['assist.kind'] AS kind,
-       count() AS generations,
+       count() AS generation_rows,
        countIf(SpanAttributes['assist.status'] = 'failed') AS failures,
        round(quantile(0.5)(toFloat64OrZero(SpanAttributes['assist.latency_ms']))) AS p50_latency_ms,
        round(sum(toFloat64OrZero(SpanAttributes['assist.cost_usd'])), 2) AS cost_usd

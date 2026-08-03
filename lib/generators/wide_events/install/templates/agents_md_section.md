@@ -5,7 +5,7 @@ root span, marked `main = true`). When you add or change a feature,
 instrument it:
 
 - `WideEvent.set("report.id" => report.id)` for domain attributes
-- `WideEvent.phase("pdf_render") { ... }` to time a block into `pdf_render.duration_ms`
+- `WideEvent.phase("pdf_render") { render_pdf }` to time a block into `pdf_render.duration_ms`
 - `WideEvent.error!(slug: "err-report-source-missing", exception: e, expected: true)` in rescue blocks
 
 Naming: dot namespaces with snake_case leaves, durations end in

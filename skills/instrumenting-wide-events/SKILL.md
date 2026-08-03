@@ -13,8 +13,8 @@ knows: the domain nouns.
 
 ## The API
 
-All calls are safe no-ops outside a request/job and never raise into app
-code: instrument freely.
+Attribute writes are safe no-ops outside a request/job; `phase` still executes
+and returns its block. Telemetry failures never raise into app code.
 
 ```ruby
 # Flat attributes, merged into the current event
@@ -40,14 +40,15 @@ handle.
 - Durations end in `_duration_ms` (float milliseconds). Counts end in `_count`.
 - Booleans read as assertions: `report.cached`, not `report.cache_status`.
 - Timestamps are RFC 3339 strings (pass a Time; the gem serializes it).
-- Sizes and counts over raw content: `note_chars: 2140`, never the note text.
+- Sizes and counts over raw content: `note.body_char_count: 2140`, never the note text.
 
 ## PII policy
 
-Opaque ids (user id, account id) are fine. Names, emails, free-text user
-input, and request params are not. If an attribute could quote user input,
-mark it `pii: review` in the registry and expect it to be scrubbed or
-excluded from forwarding.
+Apply the deployment's privacy policy to every identifier. Opaque user and
+account IDs are preferable to names or emails, but still declare them as
+`pii: opaque_id`. Exclude free-text user input and request params. If an
+attribute could quote user input, mark it `pii: review` in the registry and
+expect it to be scrubbed or excluded from forwarding.
 
 ## The registry is the contract
 
@@ -66,8 +67,8 @@ Keys containing `*` are globs for dynamic families (`feature_flag.*`). With
 `config.strict = true` in the test environment, the suite records undeclared
 attributes; `assert_registered_wide_event_attributes` fails on them. Run
 `rake wide_events:registry:docs` if this app generates the human-readable
-registry doc, and never rename a shipped attribute without a reason -
-renames orphan historical data.
+registry doc, and never rename a shipped attribute without a reason—renames
+orphan historical data.
 
 ## Prove it in tests
 
@@ -82,7 +83,7 @@ end
 ```
 
 For code that runs its own unit of work (jobs, full request dispatch), use
-`capture_wide_events { ... }` and assert on the returned events.
+`capture_wide_events { perform_work }` and assert on the returned events.
 
 ## Checklist for any instrumentation change
 
@@ -90,4 +91,4 @@ For code that runs its own unit of work (jobs, full request dispatch), use
 2. New rescue blocks that swallow errors call `error!` with a unique static slug.
 3. Every new attribute has a registry entry in the same change.
 4. A test asserts the attribute is set (`assert_wide_event`).
-5. No PII beyond opaque ids; anything questionable is flagged `pii: review`.
+5. Opaque IDs are declared `pii: opaque_id`; anything questionable is flagged `pii: review`.

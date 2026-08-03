@@ -39,12 +39,14 @@ class InstallGeneratorTest < Rails::Generators::TestCase
     run_generator
     assert_file "test/test_helper.rb", %r{require "rails/test_help"\nrequire "wide_event/test_helper"}
     assert_file "test/test_helper.rb", /class TestCase\n    include WideEvent::TestHelper/
+    assert_file "test/test_helper.rb", /include WideEvent::TestHelper\n    teardown \{ assert_registered_wide_event_attributes \}/
   end
 
   test "prints manual instructions when test_helper.rb is missing" do
     output = run_generator
     assert_no_file "test/test_helper.rb"
     assert_match(/wide_event\/test_helper/, output)
+    assert_match(/teardown \{ assert_registered_wide_event_attributes \}/, output)
   end
 
   test "appends the wide-events section to an existing AGENTS.md" do
