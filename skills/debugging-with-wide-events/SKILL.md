@@ -54,14 +54,15 @@ before reaching for logs or the trace waterfall.
 
 ## Standing queries
 
-- **Uninstrumented failures**: `error = 'true' AND SpanAttributes['exception.slug'] = ''`:
-  failures nobody wrote a rescue for. Each row is a candidate `error!` call;
-  fixing them is normal instrumentation work (see the
+- **Unnamed exception paths**: `SpanAttributes['error'] = 'true' AND
+  SpanAttributes['exception.slug'] = '' AND SpanAttributes['exception.type'] != ''`:
+  exceptions that escaped without a named handled failure. Investigate each
+  path; add a rescue and `error!` only when handling it is intentional (see the
   instrumenting-wide-events skill).
 - **Expected-error drift**: count by `exception.slug` week over week; a
   slug trending up is a quiet regression.
 - **Query-count outliers**: max `stats.postgres_query_count` per route; the
-  top entries are N+1s with names and account ids attached.
+  top entries are N+1 candidates with route names and account IDs attached.
 - **Cold starts**: correlate latency with `uptime_sec_log10` to separate
   deploy warm-up from real regressions.
 

@@ -22,7 +22,7 @@ OTEL_SERVICE_NAME=myapp \
 bin/rails server
 ```
 
-Open http://localhost:8080, pick the Traces source, and filter
+Open [http://localhost:8080](http://localhost:8080), pick the Traces source, and filter
 `SpanAttributes['main'] = 'true'`. Every request and job in your app is a row.
 For production deployments (retention, disk sizing, auth), see the
 [ClickStack docs](https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started).
@@ -75,7 +75,7 @@ WHERE SpanAttributes['main'] = 'true'
 GROUP BY account ORDER BY p95_ms DESC LIMIT 20
 ```
 
-The uninstrumented-failure to-do list (unhandled exceptions have no slug):
+Unnamed exception paths (unhandled exceptions have no slug):
 
 ```sql
 SELECT SpanAttributes['exception.type'] AS type,
@@ -85,6 +85,7 @@ FROM otel_traces
 WHERE SpanAttributes['main'] = 'true'
   AND SpanAttributes['error'] = 'true'
   AND SpanAttributes['exception.slug'] = ''
+  AND SpanAttributes['exception.type'] != ''
   AND Timestamp > now() - INTERVAL 7 DAY
 GROUP BY type, controller ORDER BY occurrences DESC
 ```

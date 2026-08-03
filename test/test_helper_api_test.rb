@@ -42,6 +42,19 @@ class TestHelperApiTest < ActiveSupport::TestCase
       "original sink must be restored"
   end
 
+  test "capture_wide_events enables instrumentation and restores it after an exception" do
+    WideEvent.configure { |config| config.enabled = false }
+
+    assert_raises(RuntimeError) do
+      capture_wide_events do
+        assert WideEvent.enabled?, "capture must enable request and job instrumentation"
+        raise "boom"
+      end
+    end
+
+    refute WideEvent.enabled?, "capture must restore the previous enabled state"
+  end
+
   test "assert_registered_wide_event_attributes fails when strict mode collected violations" do
     Tempfile.create([ "registry", ".yml" ]) do |f|
       f.write("known:\n  type: string\n")

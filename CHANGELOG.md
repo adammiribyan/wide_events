@@ -4,6 +4,11 @@
 
 - README links to the docs are absolute GitHub URLs, so they work on
   rubygems.org (relative links 404 there).
+- The install generator adds the registry-enforcement teardown to
+  `test/test_helper.rb`, and `capture_wide_events` temporarily enables
+  instrumentation while restoring the previous enabled state and sink.
+- Documentation and bundled agent skills clarify privacy handling, unnamed
+  exception queries, request/job timing, and one-generation-per-event examples.
 
 ## v0.1.2 (2026-08-03)
 

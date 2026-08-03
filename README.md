@@ -5,9 +5,9 @@
 
 One wide telemetry event per Rails request or job execution, in a database you own.
 
-Wide Events collects everything your app knows about each unit of work (route, user, account, build SHA, query counts, cache hits, feature flags, phase timings, errors) into one flat, high-cardinality event on the OpenTelemetry root span you already export. Every request becomes one row. Every question becomes one query against storage you run: ClickHouse with HyperDX on top is a proven pairing (both open source), any OTLP backend works, and a log-line sink emits one JSON event per request if you'd rather not run tracing at all.
+Wide Events collects everything your app knows about each unit of work (route, user, account, build SHA, query counts, cache hits, feature flags, phase timings, errors) into one flat, high-cardinality event on the OpenTelemetry root span you already export. Every request becomes one row, and every question becomes one query against storage you run. ClickHouse with HyperDX is a proven pairing (both open source); any OTLP backend works. If you'd rather not run tracing, the log sink emits one JSON event per request.
 
-That format matters more now that agents build with you. Telemetry stops being something humans glance at and becomes something software queries in a loop: an agent that instruments a feature, deploys it, and verifies it in production will hit your observability stack fifty times before lunch. One row per request is the densest way to feed production behavior back into a context window, and owning the storage means the loop has no price per iteration.
+That format matters more now that agents build with you. Telemetry stops being something humans only glance at and becomes something software queries repeatedly: an agent can instrument a feature, deploy it, and verify it in production. One row per request is a dense way to feed production behavior back into a context window, and owning the storage avoids metered per-event and per-query observability fees.
 
 ## Install
 
@@ -86,7 +86,7 @@ With the endpoint set, wide events enable themselves: the railtie inserts the mi
 - `job.class`, `job.queue`, `job.queue_latency_ms`, `job.executions`, `job.scheduled` (Solid Queue recurring detection built in, detector pluggable)
 - `error`, `exception.type`, `exception.message`, `uptime_sec`, `main: true`
 
-A request and the jobs it enqueues are separate units of work: the request's wide event records the enqueue inside its timings, and each job execution emits its own event carrying `job.queue_latency_ms` (time spent waiting in the queue), so queue pressure is visible per job, not smeared into request latency.
+A request and the jobs it enqueues are separate units of work. Synchronous enqueue work contributes to the request's total duration; each job execution emits its own event carrying `job.queue_latency_ms` (time spent waiting in the queue), so queue pressure is visible per job rather than folded into request latency.
 
 ## Adding your own attributes
 
@@ -95,7 +95,7 @@ WideEvent.set("report.id" => report.id, "report.format" => "pdf")
 WideEvent.phase("pdf_render") { render_pdf }         # -> pdf_render.duration_ms
 ```
 
-Every call is a safe no-op outside a unit of work and never raises into app code. A telemetry bug cannot fail a request or a job.
+Attribute writes are safe no-ops outside a unit of work; `phase` still executes and returns the wrapped block. Telemetry failures never raise into app code, so a telemetry bug cannot fail a request or job.
 
 Errors come in two shapes, and the difference is the point:
 
@@ -107,7 +107,7 @@ rescue Vendor::ApiError => e
 # Unhandled: any exception that escapes gets error: true with NO slug, automatically
 ```
 
-That makes `error = true AND exception.slug IS NULL` a standing query: every row is a failure nobody wrote a rescue for, which is a permanent, prioritized to-do list of rescues worth instrumenting.
+Filtering for `error = true`, a missing `exception.slug`, and a present `exception.type` isolates exception paths that escaped without a named handled failure. Treat the results as a prioritized investigation queue; add a rescue and `error!` only when handling the exception is intentional.
 
 ## The registry is a schema, not a wiki page
 
@@ -195,8 +195,9 @@ WideEvent.configure do |config|
     "OpenTelemetry::Instrumentation::PG" => "postgres_query",
     "OpenTelemetry::Instrumentation::Net::HTTP" => "http_call"
   }
-  config.scheduled_job_detector = ->(job) { ... }  # default detects Solid Queue recurring executions
-  config.error_handler = ->(exception, message) { ... }  # default reports via OpenTelemetry.handle_error
+  # Optional overrides; defaults detect Solid Queue recurring executions and report via OpenTelemetry.handle_error:
+  # config.scheduled_job_detector = ->(job) { MyApp.scheduled_job?(job) }
+  # config.error_handler = ->(exception, message) { Rails.error.report(exception, context: { message: message }) }
 end
 ```
 
@@ -222,7 +223,7 @@ Wide Events was extracted from a multi-tenant Rails app subject to healthcare pr
 
 ## Conventions
 
-Flat keys, dot namespaces, snake_case leaves. Durations end in `_duration_ms`, counts in `_count`, booleans read as assertions, timestamps serialize to RFC 3339. Opaque ids are fine; names, emails, and request params are not, and anything that could quote user input is flagged `pii: review` in the registry.
+Flat keys, dot namespaces, snake_case leaves. Durations end in `_duration_ms`, counts in `_count`, booleans read as assertions, timestamps serialize to RFC 3339. Apply your deployment's privacy policy to every identifier: opaque IDs are preferable to names or emails but should still be registered as `pii: opaque_id`. Exclude request params and free text, or flag them as `pii: review` for explicit handling.
 
 ## Development
 

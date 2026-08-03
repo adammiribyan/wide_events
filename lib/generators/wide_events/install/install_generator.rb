@@ -28,13 +28,17 @@ module WideEvents
         if content.match?(%r{require "rails/test_help"\n}) && content.match?(/class TestCase\n/)
           inject_into_file "test/test_helper.rb", "require \"wide_event/test_helper\"\n",
             after: %r{require "rails/test_help"\n}
-          inject_into_file "test/test_helper.rb", "    include WideEvent::TestHelper\n",
+          inject_into_file "test/test_helper.rb", <<~RUBY.indent(4),
+            include WideEvent::TestHelper
+            teardown { assert_registered_wide_event_attributes }
+          RUBY
             after: /class TestCase\n/
         else
           say_status :skip, "test/test_helper.rb (not found or unrecognized) - wire the test helper manually:", :yellow
           say <<~MSG
                 require "wide_event/test_helper"   # after rails/test_help
                 include WideEvent::TestHelper      # inside ActiveSupport::TestCase
+                teardown { assert_registered_wide_event_attributes }
           MSG
         end
       end

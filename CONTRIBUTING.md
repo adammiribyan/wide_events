@@ -16,7 +16,8 @@ full Ruby x Rails matrix plus RuboCop; both must pass.
 
 ## Ground rules
 
-- Every change ships with tests. The suite is plain Minitest under `test/`.
+- Every behavior change ships with tests. The suite is plain Minitest under
+  `test/`; documentation-only changes don't need synthetic test coverage.
 - Telemetry never raises into app code: any new entry point rescues and
   reports through `WideEvent.handle_error`. Tests must cover the failure
   path, not only the happy path.

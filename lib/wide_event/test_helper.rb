@@ -29,17 +29,21 @@ module WideEvent
       attrs
     end
 
-    # Swaps the sink for an in-memory one for the duration of the block and
-    # returns every wide event flushed inside it. Use around code that runs
-    # its own unit of work (jobs, full request dispatch).
+    # Enables instrumentation and swaps the sink for an in-memory one for the
+    # duration of the block, restoring both settings afterward. Returns every
+    # wide event flushed inside it. Use around code that runs its own unit of
+    # work (jobs, full request dispatch).
     def capture_wide_events(&block)
       original = WideEvent.config.sink
+      original_enabled = WideEvent.config.enabled
       sink = Sinks::Memory.new
       WideEvent.config.sink = sink
+      WideEvent.config.enabled = true
       block.call
       sink.events
     ensure
       WideEvent.config.sink = original
+      WideEvent.config.enabled = original_enabled
     end
 
     # Fails if strict mode saw any attribute that isn't declared in the
