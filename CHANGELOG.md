@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.1 (2026-08-03)
 
 - The install generator wires `WideEvent::TestHelper` into
   `test/test_helper.rb` (or prints manual instructions when the file

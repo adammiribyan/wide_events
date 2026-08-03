@@ -20,4 +20,5 @@ git tag "v$VERSION"
 git push --tags
 gem build wide_events.gemspec
 gem push "wide_events-$VERSION.gem" --host https://rubygems.org
+gh release create "v$VERSION" "wide_events-$VERSION.gem" --title "v$VERSION" --generate-notes
 rm "wide_events-$VERSION.gem"
