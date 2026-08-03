@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -eu
+
+VERSION=${1:-}
+
+if [ -z "$VERSION" ]
+then
+  echo "Usage: bin/release <version>"
+  exit 1
+fi
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+printf "module WideEvent\n  VERSION = \"%s\"\nend\n" "$VERSION" > lib/wide_event/version.rb
+bundle
+git add Gemfile.lock lib/wide_event/version.rb
+git commit -m "Bump version for $VERSION"
+git push
+git tag "v$VERSION"
+git push --tags
+gem build wide_events.gemspec
+gem push "wide_events-$VERSION.gem" --host https://rubygems.org
+rm "wide_events-$VERSION.gem"

@@ -114,6 +114,16 @@ Flat keys, dot namespaces, snake_case leaves. Durations end in `_duration_ms`, c
 
 Unhandled exceptions get `error: true` with no slug, deliberately: the missing slug marks the rescue you haven't instrumented yet.
 
+## Development
+
+```bash
+bin/setup                 # bundle install + appraisal gemfiles
+bundle exec rake test     # run the suite
+bin/rubocop               # lint (rubocop-rails-omakase)
+```
+
+The CI matrix runs the suite across Ruby 3.2 to 4.0 and Rails 7.1 to main via [Appraisal](https://github.com/thoughtbot/appraisal); run a specific combination locally with `BUNDLE_GEMFILE=gemfiles/rails_7_1.gemfile bundle exec rake test`. Releases go out with `bin/release <version>`.
+
 ## Requirements
 
 Ruby >= 3.2, Rails >= 7.1 (activesupport and rack are the only hard dependencies; opentelemetry-sdk and useragent are optional and detected at runtime).

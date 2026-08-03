@@ -2,5 +2,5 @@
 /pkg/
 /tmp/
 /test/tmp/
-Gemfile.lock
+/gemfiles/*.gemfile.lock
 *.gem
