@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- README links to the docs are absolute GitHub URLs, so they work on
+  rubygems.org (relative links 404 there).
+
 ## v0.1.2 (2026-08-03)
 
 - README "In production" section and `docs/production-example.md`: an

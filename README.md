@@ -204,7 +204,7 @@ Log sink notes: events go to `config.logger` (or `Rails.logger`) at info level a
 
 ## Querying: ClickHouse + HyperDX
 
-[docs/clickhouse-hyperdx.md](docs/clickhouse-hyperdx.md) has a local quickstart (one container) and a query cookbook. The flavor:
+[docs/clickhouse-hyperdx.md](https://github.com/adammiribyan/wide_events/blob/main/docs/clickhouse-hyperdx.md) has a local quickstart (one container) and a query cookbook. The flavor:
 
 ```sql
 SELECT SpanAttributes['http.route.controller'] AS controller,
@@ -218,7 +218,7 @@ GROUP BY controller ORDER BY p50_ms DESC LIMIT 15
 
 ## In production
 
-Wide Events was extracted from a multi-tenant Rails app subject to healthcare privacy rules, where it runs in staging and production today: one row per request and job execution, exported over OTLP into self-hosted ClickStack. A request that runs a hybrid search and drafts a reply with an LLM still lands as one event, carrying the account, the feature flags evaluated, search quality (semantic hits kept, top cosine similarity), the model, tokens, latency, and cost, the Postgres query count, and an error slug for anything rescued along the way. [docs/production-example.md](docs/production-example.md) shows a full anonymized event, the instrumentation patterns behind it, and two standing queries taken from that deployment.
+Wide Events was extracted from a multi-tenant Rails app subject to healthcare privacy rules, where it runs in staging and production today: one row per request and job execution, exported over OTLP into self-hosted ClickStack. A request that runs a hybrid search and drafts a reply with an LLM still lands as one event, carrying the account, the feature flags evaluated, search quality (semantic hits kept, top cosine similarity), the model, tokens, latency, and cost, the Postgres query count, and an error slug for anything rescued along the way. [docs/production-example.md](https://github.com/adammiribyan/wide_events/blob/main/docs/production-example.md) shows a full anonymized event, the instrumentation patterns behind it, and two standing queries taken from that deployment.
 
 ## Conventions
 
