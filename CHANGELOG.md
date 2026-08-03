@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.3 (2026-08-03)
 
 - README links to the docs are absolute GitHub URLs, so they work on
   rubygems.org (relative links 404 there).
