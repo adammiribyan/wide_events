@@ -12,8 +12,11 @@ fi
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 printf "module WideEvent\n  VERSION = \"%s\"\nend\n" "$VERSION" > lib/wide_event/version.rb
+if grep -q '^## Unreleased' CHANGELOG.md; then
+  perl -pi -e "s/^## Unreleased/## v$VERSION ($(date +%Y-%m-%d))/" CHANGELOG.md
+fi
 bundle
-git add Gemfile.lock lib/wide_event/version.rb
+git add Gemfile.lock lib/wide_event/version.rb CHANGELOG.md
 git commit -m "Bump version for $VERSION"
 git push
 git tag "v$VERSION"
