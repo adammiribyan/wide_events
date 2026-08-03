@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 (2026-08-03)
 
 - README "In production" section and `docs/production-example.md`: an
   anonymized composite event, instrumentation patterns, and standing
