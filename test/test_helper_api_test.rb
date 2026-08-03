@@ -59,4 +59,18 @@ class TestHelperApiTest < ActiveSupport::TestCase
   test "assert_registered_wide_event_attributes passes without a registry or violations" do
     assert_registered_wide_event_attributes
   end
+
+  test "assert_registered_wide_event_attributes drains violations so it can run in a teardown" do
+    Tempfile.create([ "registry", ".yml" ]) do |f|
+      f.write("known:\n  type: string\n")
+      f.flush
+      WideEvent.configure do |c|
+        c.registry_path = f.path
+        c.strict = true
+      end
+      WideEvent.with { WideEvent.set("unknown.attr" => 1) }
+      assert_raises(Minitest::Assertion) { assert_registered_wide_event_attributes }
+      assert_registered_wide_event_attributes
+    end
+  end
 end

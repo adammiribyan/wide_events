@@ -20,6 +20,33 @@ class InstallGeneratorTest < Rails::Generators::TestCase
     assert_file "AGENTS.md", /wide event/i
   end
 
+  DEFAULT_TEST_HELPER = <<~RUBY
+    ENV["RAILS_ENV"] ||= "test"
+    require_relative "../config/environment"
+    require "rails/test_help"
+
+    module ActiveSupport
+      class TestCase
+        parallelize(workers: :number_of_processors)
+        fixtures :all
+      end
+    end
+  RUBY
+
+  test "wires WideEvent::TestHelper into a default test_helper.rb" do
+    FileUtils.mkdir_p(File.join(destination_root, "test"))
+    File.write(File.join(destination_root, "test/test_helper.rb"), DEFAULT_TEST_HELPER)
+    run_generator
+    assert_file "test/test_helper.rb", %r{require "rails/test_help"\nrequire "wide_event/test_helper"}
+    assert_file "test/test_helper.rb", /class TestCase\n    include WideEvent::TestHelper/
+  end
+
+  test "prints manual instructions when test_helper.rb is missing" do
+    output = run_generator
+    assert_no_file "test/test_helper.rb"
+    assert_match(/wide_event\/test_helper/, output)
+  end
+
   test "appends the wide-events section to an existing AGENTS.md" do
     FileUtils.mkdir_p(destination_root)
     File.write(File.join(destination_root, "AGENTS.md"), "# My app\n")

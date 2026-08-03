@@ -49,6 +49,11 @@ module WideEvent
       @violations.to_a
     end
 
+    def clear_violations!
+      @mutex.synchronize { @violations.clear }
+      nil
+    end
+
     def validate
       entries.filter_map do |key, entry|
         unless entry.is_a?(Hash) && entry["type"]

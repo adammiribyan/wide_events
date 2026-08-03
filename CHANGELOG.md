@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- The install generator wires `WideEvent::TestHelper` into
+  `test/test_helper.rb` (or prints manual instructions when the file
+  isn't recognized).
+- Development boot logs a one-time notice when wide events are disabled,
+  pointing at the `:log` sink quickstart.
+- `assert_registered_wide_event_attributes` resets the violation tally
+  after each check, so it can run as a global `teardown` and works with
+  parallel test workers.
+- README rewritten around first-run experience: 60-second `:log` sink
+  quickstart, OpenTelemetry setup guide, enablement modes, end-to-end
+  registry workflow, log sink operations, request-vs-job event semantics.
+- New `docs/clickhouse-hyperdx.md`: local quickstart and query cookbook.
+
 ## v0.1.0 (2026-08-03)
 
 First release, extracted from a production Rails app.

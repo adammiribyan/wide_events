@@ -21,6 +21,23 @@ module WideEvents
           create_file "AGENTS.md", section
         end
       end
+
+      def wire_test_helper
+        path = File.join(destination_root, "test/test_helper.rb")
+        content = File.exist?(path) ? File.read(path) : ""
+        if content.match?(%r{require "rails/test_help"\n}) && content.match?(/class TestCase\n/)
+          inject_into_file "test/test_helper.rb", "require \"wide_event/test_helper\"\n",
+            after: %r{require "rails/test_help"\n}
+          inject_into_file "test/test_helper.rb", "    include WideEvent::TestHelper\n",
+            after: /class TestCase\n/
+        else
+          say_status :skip, "test/test_helper.rb (not found or unrecognized) - wire the test helper manually:", :yellow
+          say <<~MSG
+                require "wide_event/test_helper"   # after rails/test_help
+                include WideEvent::TestHelper      # inside ActiveSupport::TestCase
+          MSG
+        end
+      end
     end
   end
 end

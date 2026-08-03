@@ -25,6 +25,40 @@ class RailtieTest < ActiveSupport::TestCase
     puts "BOOT OK"
   RUBY
 
+  NOTICE_BOOT_SCRIPT = <<~RUBY
+    require "rails"
+    require "active_job/railtie"
+    require "wide_events"
+
+    class Dummy < Rails::Application
+      config.eager_load = false
+      config.logger = Logger.new(STDOUT)
+      config.secret_key_base = "test"
+      config.active_job.queue_adapter = :test
+    end
+    Dummy.initialize!
+  RUBY
+
+  test "boots with a one-time notice in development when disabled" do
+    output, status = Open3.capture2e(
+      { "OTEL_EXPORTER_OTLP_ENDPOINT" => nil, "RAILS_ENV" => "development" },
+      "bundle", "exec", "ruby", "-e", NOTICE_BOOT_SCRIPT,
+      chdir: File.expand_path("..", __dir__)
+    )
+    assert status.success?, output
+    assert_match(/wide_events: installed but disabled/, output)
+  end
+
+  test "boots without the notice outside development" do
+    output, status = Open3.capture2e(
+      { "OTEL_EXPORTER_OTLP_ENDPOINT" => nil, "RAILS_ENV" => "production" },
+      "bundle", "exec", "ruby", "-e", NOTICE_BOOT_SCRIPT,
+      chdir: File.expand_path("..", __dir__)
+    )
+    assert status.success?, output
+    refute_match(/wide_events: installed but disabled/, output)
+  end
+
   test "railtie inserts the middleware below the executor and instruments ActiveJob" do
     output, status = Open3.capture2e(
       { "OTEL_EXPORTER_OTLP_ENDPOINT" => nil },

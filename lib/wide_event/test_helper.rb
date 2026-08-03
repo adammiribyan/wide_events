@@ -43,11 +43,18 @@ module WideEvent
     end
 
     # Fails if strict mode saw any attribute that isn't declared in the
-    # registry. Call from a dedicated test (or a teardown hook) with
-    # config.strict = true to make the registry an enforced schema.
+    # registry since the last check, then resets the tally. The reset is what
+    # makes a global teardown hook practical: the test that set the
+    # undeclared attribute fails; later tests stay green.
+    #
+    #   class ActiveSupport::TestCase
+    #     include WideEvent::TestHelper
+    #     teardown { assert_registered_wide_event_attributes }
+    #   end
     def assert_registered_wide_event_attributes
       registry = WideEvent.config.registry
       violations = registry ? registry.violations : []
+      registry&.clear_violations!
       assert violations.empty?,
         "unregistered wide-event attributes #{violations.sort.inspect} - declare them in #{WideEvent.config.registry_path}"
     end

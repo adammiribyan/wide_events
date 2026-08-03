@@ -22,7 +22,15 @@ module WideEvent
     # After the app's own initializers, so the host's OpenTelemetry::SDK
     # configuration (and any WideEvent.configure block) has already run.
     config.after_initialize do
-      WideEvent.install! if WideEvent.enabled?
+      if WideEvent.enabled?
+        WideEvent.install!
+      elsif Rails.env.development?
+        Rails.logger&.info(
+          "wide_events: installed but disabled (OTEL_EXPORTER_OTLP_ENDPOINT is not set). " \
+          "To see events locally, set `config.enabled = true` and `config.sink = :log` " \
+          "in config/initializers/wide_events.rb."
+        )
+      end
     end
 
     rake_tasks do
