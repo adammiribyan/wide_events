@@ -1,0 +1,131 @@
+# Attributes the gem sets on every wide event. App attributes belong in the
+# app's own registry file (config/wide_event/registry.yml), which merges over
+# these entries.
+main:
+  type: boolean
+  set_by: wide_events
+  pii: none
+  notes: Marks the root span as a wide event. Query surface is `main = true`.
+error:
+  type: boolean
+  set_by: wide_events
+  pii: none
+  notes: Status >= 500, an unhandled exception, or an error! call.
+uptime_sec:
+  type: integer
+  set_by: wide_events
+  pii: none
+  notes: Process age at the time of the event.
+uptime_sec_log10:
+  type: float
+  set_by: wide_events
+  pii: none
+  notes: log10 of uptime_sec, for cold-start histograms.
+http.request.id:
+  type: string
+  set_by: wide_events
+  pii: none
+  notes: X-Request-Id / ActionDispatch request id.
+http.request.body_size:
+  type: integer
+  set_by: wide_events
+  pii: none
+http.response.status_code:
+  type: integer
+  set_by: wide_events
+  pii: none
+http.route.controller:
+  type: string
+  set_by: wide_events
+  pii: none
+  notes: Controller#action, from process_action.action_controller.
+user_agent.original:
+  type: string
+  set_by: wide_events
+  pii: none
+  notes: Capped at 300 chars.
+user_agent.browser:
+  type: string
+  set_by: wide_events
+  pii: none
+user_agent.browser_version:
+  type: string
+  set_by: wide_events
+  pii: none
+user_agent.os:
+  type: string
+  set_by: wide_events
+  pii: none
+user_agent.platform:
+  type: string
+  set_by: wide_events
+  pii: none
+db.duration_ms:
+  type: float
+  set_by: wide_events
+  pii: none
+  notes: Rails' own db_runtime measurement.
+view.duration_ms:
+  type: float
+  set_by: wide_events
+  pii: none
+  notes: Rails' own view_runtime measurement.
+"cache.*":
+  type: boolean
+  set_by: wide_events
+  pii: none
+  notes: Hit/miss per normalized cache key prefix, capped per event.
+"stats.*":
+  type: [integer, float]
+  set_by: wide_events
+  pii: none
+  notes: Per-dependency child span counts and total durations.
+job.class:
+  type: string
+  set_by: wide_events
+  pii: none
+job.queue:
+  type: string
+  set_by: wide_events
+  pii: none
+job.id:
+  type: string
+  set_by: wide_events
+  pii: none
+job.executions:
+  type: integer
+  set_by: wide_events
+  pii: none
+  notes: Retry count, 1 on the first attempt.
+job.enqueued_at:
+  type: string
+  set_by: wide_events
+  pii: none
+  notes: RFC 3339.
+job.queue_latency_ms:
+  type: integer
+  set_by: wide_events
+  pii: none
+job.scheduled:
+  type: boolean
+  set_by: wide_events
+  pii: none
+  notes: True for recurring/scheduled executions (Solid Queue detector by default).
+exception.slug:
+  type: string
+  set_by: app rescue sites via error!
+  pii: none
+  notes: Static kebab-case identifier. Absent on unhandled exceptions, by design.
+exception.type:
+  type: string
+  set_by: wide_events
+  pii: none
+exception.message:
+  type: string
+  set_by: wide_events
+  pii: review
+  notes: Capped at 500 chars. May quote user input (review before forwarding).
+exception.expected:
+  type: boolean
+  set_by: app rescue sites via error!
+  pii: none

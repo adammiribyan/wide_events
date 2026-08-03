@@ -1,0 +1,16 @@
+# Attributes your app sets on wide events, one entry per attribute. The gem's
+# own attributes (main, error, http.*, user_agent.*, job.*, stats.*, cache.*,
+# db/view durations, exception.*) are registered by default: declare only
+# what your code adds. Keys containing `*` are globs for dynamic attributes.
+#
+# Fields: type (string/integer/float/boolean, or a list), set_by, pii
+# (none/opaque_id/review), notes, forward (optional list of sinks that may
+# receive the attribute).
+#
+# Example:
+#
+# report.format:
+#   type: string
+#   set_by: ReportsController#create
+#   pii: none
+#   notes: pdf or csv

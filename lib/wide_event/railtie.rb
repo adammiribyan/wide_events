@@ -1,0 +1,32 @@
+require "rails/railtie"
+
+module WideEvent
+  class Railtie < Rails::Railtie
+    # Below ActionDispatch::Executor on purpose: the executor clears
+    # IsolatedExecutionState on completion; above it the store would be gone
+    # before the flush. With OTel Rack instrumentation at the top of the
+    # stack, the flush still lands inside the root span.
+    initializer "wide_event.middleware" do |app|
+      app.middleware.insert_after ActionDispatch::Executor, WideEvent::Middleware
+    end
+
+    initializer "wide_event.active_job" do
+      ActiveSupport.on_load(:active_job) { include WideEvent::JobInstrumentation }
+    end
+
+    initializer "wide_event.registry" do |app|
+      path = app.root.join("config", "wide_event", "registry.yml")
+      WideEvent.config.registry_path ||= path.to_s if path.exist?
+    end
+
+    # After the app's own initializers, so the host's OpenTelemetry::SDK
+    # configuration (and any WideEvent.configure block) has already run.
+    config.after_initialize do
+      WideEvent.install! if WideEvent.enabled?
+    end
+
+    rake_tasks do
+      load File.expand_path("tasks/registry.rake", __dir__)
+    end
+  end
+end
