@@ -1,8 +1,8 @@
-# wide_events
+# Wide Events
 
 One wide telemetry event per Rails request or job execution, in a database you own.
 
-wide_events collects everything your app knows about each unit of work (route, user, account, build SHA, query counts, cache hits, feature flags, phase timings, errors) into one flat, high-cardinality event on the OpenTelemetry root span you already export. Every request becomes one row. Every question becomes one query against storage you run: ClickHouse with HyperDX on top is a proven pairing (both open source), any OTLP backend works, and a log-line sink emits one JSON event per request if you'd rather not run tracing at all.
+Wide Events collects everything your app knows about each unit of work (route, user, account, build SHA, query counts, cache hits, feature flags, phase timings, errors) into one flat, high-cardinality event on the OpenTelemetry root span you already export. Every request becomes one row. Every question becomes one query against storage you run: ClickHouse with HyperDX on top is a proven pairing (both open source), any OTLP backend works, and a log-line sink emits one JSON event per request if you'd rather not run tracing at all.
 
 That format matters more now that agents build with you. Telemetry stops being something humans glance at and becomes something software queries in a loop: an agent that instruments a feature, deploys it, and verifies it in production will hit your observability stack fifty times before lunch. One row per request is the densest way to feed production behavior back into a context window, and owning the storage means the loop has no price per iteration.
 
