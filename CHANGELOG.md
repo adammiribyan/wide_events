@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- README "In production" section and `docs/production-example.md`: an
+  anonymized composite event, instrumentation patterns, and standing
+  queries from the production app the gem was extracted from.
+
 ## v0.1.1 (2026-08-03)
 
 - The install generator wires `WideEvent::TestHelper` into

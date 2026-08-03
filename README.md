@@ -216,6 +216,10 @@ WHERE SpanAttributes['main'] = 'true'
 GROUP BY controller ORDER BY p50_ms DESC LIMIT 15
 ```
 
+## In production
+
+Wide Events was extracted from a multi-tenant Rails app subject to healthcare privacy rules, where it runs in staging and production today: one row per request and job execution, exported over OTLP into self-hosted ClickStack. A request that runs a hybrid search and drafts a reply with an LLM still lands as one event, carrying the account, the feature flags evaluated, search quality (semantic hits kept, top cosine similarity), the model, tokens, latency, and cost, the Postgres query count, and an error slug for anything rescued along the way. [docs/production-example.md](docs/production-example.md) shows a full anonymized event, the instrumentation patterns behind it, and two standing queries taken from that deployment.
+
 ## Conventions
 
 Flat keys, dot namespaces, snake_case leaves. Durations end in `_duration_ms`, counts in `_count`, booleans read as assertions, timestamps serialize to RFC 3339. Opaque ids are fine; names, emails, and request params are not, and anything that could quote user input is flagged `pii: review` in the registry.
