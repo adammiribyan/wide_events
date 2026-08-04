@@ -62,10 +62,8 @@ module WideEvent
 
     private
 
-    # `registry_path` stays relative (it's committed into the generated doc's
-    # header); resolution against Rails.root happens only here, at open time.
-    # An absolute path wins inside Pathname#join, so apps pointing elsewhere
-    # keep working.
+    # `registry_path` stays relative so the generated doc can commit it;
+    # absolute paths win inside Pathname#join and pass through as-is.
     def resolved_registry_path
       root = Rails.root if defined?(Rails) && Rails.respond_to?(:root)
       root ? root.join(@registry_path).to_s : @registry_path

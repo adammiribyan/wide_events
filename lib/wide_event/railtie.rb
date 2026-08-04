@@ -14,8 +14,6 @@ module WideEvent
       ActiveSupport.on_load(:active_job) { include WideEvent::JobInstrumentation }
     end
 
-    # Stored relative: Configuration resolves it against Rails.root at open
-    # time, and the docs task commits it into the generated header.
     initializer "wide_event.registry" do |app|
       path = "config/wide_event/registry.yml"
       WideEvent.config.registry_path ||= path if app.root.join(path).exist?

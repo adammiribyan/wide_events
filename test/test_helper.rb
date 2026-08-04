@@ -20,8 +20,6 @@ class ActiveSupport::TestCase
     end
   end
 
-  # The gem's suite has no Rails app; registry-path resolution only needs
-  # `Rails.root`.
   def with_rails_root(dir)
     defined_here = !defined?(Rails)
     Object.const_set(:Rails, Module.new) if defined_here
