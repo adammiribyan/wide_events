@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `rake wide_events:registry:docs` names the registry relative to
+  `Rails.root` in the generated header. The absolute path it used before
+  only existed on the machine that ran the task, and rewrote itself on
+  every other checkout, so the committed doc was never idempotent.
+- `Registry#to_markdown` collapses whitespace and escapes pipes in every
+  cell. A `notes: >` folded scalar keeps a trailing newline, which pushed
+  the row's closing pipe onto its own line and split the table.
+
 ## v0.1.3 (2026-08-03)
 
 - README links to the docs are absolute GitHub URLs, so they work on

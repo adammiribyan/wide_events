@@ -76,6 +76,34 @@ class RegistryTest < ActiveSupport::TestCase
     end
   end
 
+  test "to_markdown keeps a folded-scalar note on one row" do
+    yaml = <<~YAML
+      report.format:
+        type: string
+        set_by: ReportsController#create
+        pii: none
+        notes: >
+          pdf or csv, whichever the
+          requesting user picked
+    YAML
+    with_registry(yaml) do |registry|
+      doc = registry.to_markdown
+      assert_match(
+        /^\| `report\.format` \| string \| ReportsController#create \| none \| pdf or csv, whichever the requesting user picked \|$/,
+        doc
+      )
+      doc.each_line do |line|
+        assert_equal 6, line.count("|"), "malformed table row: #{line.inspect}"
+      end
+    end
+  end
+
+  test "to_markdown escapes pipes so a value cannot open extra columns" do
+    with_registry("report.format:\n  type: string\n  notes: pdf | csv\n") do |registry|
+      assert_match(/\| `report\.format` \| string \|  \|  \| pdf \\\| csv \|/, registry.to_markdown)
+    end
+  end
+
   test "strict mode tracks unregistered attributes set during a unit of work" do
     Tempfile.create([ "registry", ".yml" ]) do |f|
       f.write(APP_YAML)

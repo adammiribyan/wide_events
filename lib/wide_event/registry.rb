@@ -66,9 +66,18 @@ module WideEvent
       lines = [ "| Attribute | Type | Set by | PII | Notes |", "|---|---|---|---|---|" ]
       entries.each do |key, entry|
         entry = {} unless entry.is_a?(Hash)
-        lines << "| `#{key}` | #{Array(entry["type"]).join(", ")} | #{entry["set_by"]} | #{entry["pii"]} | #{entry["notes"]} |"
+        cells = [ Array(entry["type"]).join(", "), entry["set_by"], entry["pii"], entry["notes"] ]
+        lines << "| `#{key}` | #{cells.map { |value| cell(value) }.join(" | ")} |"
       end
       lines.join("\n") + "\n"
+    end
+
+    private
+
+    # A table cell can hold neither a newline (folded scalars keep a trailing
+    # one) nor a bare pipe.
+    def cell(value)
+      value.to_s.gsub(/\s+/, " ").strip.gsub("|") { "\\|" }
     end
   end
 end
