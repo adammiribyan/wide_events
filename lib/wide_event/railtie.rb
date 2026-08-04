@@ -15,8 +15,8 @@ module WideEvent
     end
 
     initializer "wide_event.registry" do |app|
-      path = app.root.join("config", "wide_event", "registry.yml")
-      WideEvent.config.registry_path ||= path.to_s if path.exist?
+      path = "config/wide_event/registry.yml"
+      WideEvent.config.registry_path ||= path if app.root.join(path).exist?
     end
 
     # After the app's own initializers, so the host's OpenTelemetry::SDK

@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- `rake wide_events:registry:docs` names the registry relative to
-  `Rails.root` in the generated header. The absolute path it used before
-  only existed on the machine that ran the task, and rewrote itself on
-  every other checkout, so the committed doc was never idempotent.
+- The railtie stores `registry_path` relative to the app root
+  (`config/wide_event/registry.yml`) and `Configuration` resolves it via
+  `Rails.root.join` when opening the registry. The generated doc's header
+  previously committed the machine-specific absolute path, which rewrote
+  itself on every other checkout; it now carries the relative path.
+  Explicitly configured absolute paths keep working unchanged.
 - `Registry#to_markdown` collapses whitespace and escapes pipes in every
   cell. A `notes: >` folded scalar keeps a trailing newline, which pushed
   the row's closing pipe onto its own line and split the table.
