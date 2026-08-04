@@ -9,6 +9,8 @@
 - `Registry#to_markdown` collapses whitespace and escapes pipes in every
   cell. A `notes: >` folded scalar keeps a trailing newline, which pushed
   the row's closing pipe onto its own line and split the table.
+- The generated doc's title is "Wide events attribute registry" — no
+  hyphen; that spelling belongs to file names, not copy.
 
 ## v0.1.3 (2026-08-03)
 

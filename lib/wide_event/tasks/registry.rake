@@ -29,7 +29,7 @@ namespace :wide_events do
       path = ENV["WIDE_EVENTS_DOCS_PATH"] || "docs/wide-events-registry.md"
       require "fileutils"
       FileUtils.mkdir_p(File.dirname(path))
-      header = "# Wide-events attribute registry\n\n" \
+      header = "# Wide events attribute registry\n\n" \
                "Generated from `#{relative_to_root.call(WideEvent.config.registry_path)}` by `rake wide_events:registry:docs`. " \
                "Do not edit by hand.\n\n"
       File.write(path, header + registry.to_markdown)
