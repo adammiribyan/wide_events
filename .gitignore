@@ -2,5 +2,6 @@
 /pkg/
 /tmp/
 /test/tmp/
+/.worktrees/
 /gemfiles/*.gemfile.lock
 *.gem
