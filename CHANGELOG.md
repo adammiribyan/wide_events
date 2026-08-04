@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.4 (2026-08-04)
 
 - The railtie stores `registry_path` relative to the app root
   (`config/wide_event/registry.yml`) and `Configuration` resolves it via
