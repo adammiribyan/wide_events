@@ -1,18 +1,5 @@
-require "pathname"
-
 namespace :wide_events do
   namespace :registry do
-    # The generated doc gets committed, so its header must not carry the
-    # machine-specific absolute path that `registry_path` holds.
-    relative_to_root = lambda do |path|
-      root = Rails.root if defined?(Rails) && Rails.respond_to?(:root)
-      return path.to_s if root.nil?
-      relative = Pathname.new(path.to_s).relative_path_from(Pathname.new(root.to_s)).to_s
-      relative == ".." || relative.start_with?("../") ? path.to_s : relative
-    rescue ArgumentError
-      path.to_s
-    end
-
     desc "Validate the wide-event attribute registry"
     task check: :environment do
       registry = WideEvent.config.registry
@@ -30,7 +17,7 @@ namespace :wide_events do
       require "fileutils"
       FileUtils.mkdir_p(File.dirname(path))
       header = "# Wide events attribute registry\n\n" \
-               "Generated from `#{relative_to_root.call(WideEvent.config.registry_path)}` by `rake wide_events:registry:docs`. " \
+               "Generated from `#{WideEvent.config.registry_path}` by `rake wide_events:registry:docs`. " \
                "Do not edit by hand.\n\n"
       File.write(path, header + registry.to_markdown)
       puts "wrote #{path}"

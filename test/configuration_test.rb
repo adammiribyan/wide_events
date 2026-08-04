@@ -1,4 +1,7 @@
 require "test_helper"
+require "tempfile"
+require "tmpdir"
+require "fileutils"
 
 class ConfigurationTest < ActiveSupport::TestCase
   test "disabled by default without an OTLP endpoint" do
@@ -47,6 +50,32 @@ class ConfigurationTest < ActiveSupport::TestCase
     assert_equal false, WideEvent.enabled?
     WideEvent.configure { |c| c.enabled = true }
     assert_equal true, WideEvent.enabled?
+  end
+
+  test "a relative registry_path resolves against Rails.root" do
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "config", "wide_event"))
+      File.write(File.join(dir, "config", "wide_event", "registry.yml"), "report.format:\n  type: string\n")
+      with_rails_root(dir) do
+        config = WideEvent::Configuration.new
+        config.registry_path = "config/wide_event/registry.yml"
+        assert config.registry.registered?("report.format")
+      end
+    end
+  end
+
+  test "an absolute registry_path is opened as-is even with Rails.root set" do
+    Tempfile.create([ "registry", ".yml" ]) do |f|
+      f.write("report.format:\n  type: string\n")
+      f.flush
+      Dir.mktmpdir do |dir|
+        with_rails_root(dir) do
+          config = WideEvent::Configuration.new
+          config.registry_path = f.path
+          assert config.registry.registered?("report.format")
+        end
+      end
+    end
   end
 
   test "scheduled_job_detector defaults to the Solid Queue detector" do

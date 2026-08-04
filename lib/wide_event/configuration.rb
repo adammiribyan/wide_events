@@ -57,7 +57,18 @@ module WideEvent
 
     def registry
       return nil if @registry_path.nil?
-      @registry ||= Registry.load(@registry_path)
+      @registry ||= Registry.load(resolved_registry_path)
+    end
+
+    private
+
+    # `registry_path` stays relative (it's committed into the generated doc's
+    # header); resolution against Rails.root happens only here, at open time.
+    # An absolute path wins inside Pathname#join, so apps pointing elsewhere
+    # keep working.
+    def resolved_registry_path
+      root = Rails.root if defined?(Rails) && Rails.respond_to?(:root)
+      root ? root.join(@registry_path).to_s : @registry_path
     end
   end
 end
