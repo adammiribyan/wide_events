@@ -212,6 +212,61 @@ func TestPolicyRejectsMacroWithNullSideEffectMetadataBeforeSleep(t *testing.T) {
 	assert.Less(t, time.Since(started), 500*time.Millisecond)
 }
 
+func TestPolicyDoesNotApplyBuiltInNullExceptionsToPersistentTableMacros(t *testing.T) {
+	database := openQueryTestDatabase(t)
+	connection, err := database.QueryConnection(context.Background())
+	require.NoError(t, err)
+	_, err = connection.ExecContext(context.Background(), "CREATE SCHEMA malicious")
+	require.NoError(t, err)
+	for _, name := range []string{"range", "read_csv"} {
+		_, err = connection.ExecContext(context.Background(), fmt.Sprintf(
+			`CREATE MACRO malicious."%s"() AS TABLE SELECT pg_sleep(1) AS slept`, name,
+		))
+		require.NoError(t, err)
+	}
+	require.NoError(t, connection.Close())
+
+	executor := NewExecutor(database, Limits{}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	var output bytes.Buffer
+	_, err = executor.Execute(context.Background(), Request{
+		ProtocolVersion: 1,
+		SQL:             "SELECT * FROM system.main.range(1)",
+		Format:          "json",
+	}, &output)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"columns":["range"],"rows":[[0]],"truncated":false}`, output.String())
+
+	output.Reset()
+	_, err = executor.Execute(context.Background(), Request{
+		ProtocolVersion: 1,
+		SQL:             "SELECT * FROM system.main.read_csv('/etc/passwd')",
+		Format:          "json",
+	}, &output)
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, ErrReadOnlyRequired)
+
+	for _, statement := range []string{
+		`SELECT * FROM malicious."range"()`,
+		`SELECT * FROM malicious."read_csv"()`,
+	} {
+		t.Run(statement, func(t *testing.T) {
+			started := time.Now()
+			err := executor.Validate(context.Background(), statement)
+			assert.ErrorIs(t, err, ErrReadOnlyRequired)
+			assert.Less(t, time.Since(started), 500*time.Millisecond)
+
+			started = time.Now()
+			_, err = executor.Execute(context.Background(), Request{
+				ProtocolVersion: 1,
+				SQL:             statement,
+				Format:          "json",
+			}, &bytes.Buffer{})
+			assert.ErrorIs(t, err, ErrReadOnlyRequired)
+			assert.Less(t, time.Since(started), 500*time.Millisecond)
+		})
+	}
+}
+
 func TestFifthWaiterGetsBusyWithoutEnteringActivePool(t *testing.T) {
 	limits := Limits{Active: 2, Waiting: 4, WaitTimeout: 2 * time.Second, ExecutionTimeout: 5 * time.Second}
 	executor := newTestExecutor(t, limits)

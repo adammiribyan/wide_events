@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -20,21 +21,33 @@ var (
 	ErrUnavailable      = errors.New("query service unavailable")
 )
 
-// DuckDB 1.5.5 leaves has_side_effects NULL for these required table
-// functions. range is an in-engine generator. The external readers are safe
-// only because storage locks enable_external_access=false before serving SQL.
-// Keep this pinned exception set minimal; every other NULL remains rejected.
 type functionReference struct {
+	catalog string
+	schema  string
 	name    string
-	context string
+	kind    string
 }
 
-var controlledNullFunctions = map[functionReference]struct{}{
-	{name: "glob", context: "table"}:         {},
-	{name: "range", context: "table"}:        {},
-	{name: "read_csv", context: "table"}:     {},
-	{name: "read_json", context: "table"}:    {},
-	{name: "read_parquet", context: "table"}: {},
+type functionIdentity struct {
+	catalog  string
+	schema   string
+	name     string
+	kind     string
+	aliasOf  string
+	internal bool
+}
+
+// DuckDB 1.5.5 leaves has_side_effects NULL for these required built-in table
+// functions. range is an in-engine generator. The external readers are safe
+// only because storage locks enable_external_access=false before serving SQL.
+// Identity and kind are pinned so this exception never covers macros, aliases,
+// or user-defined objects with the same base name.
+var controlledNullFunctions = map[functionIdentity]struct{}{
+	{catalog: "system", schema: "main", name: "glob", kind: "table", internal: true}:         {},
+	{catalog: "system", schema: "main", name: "range", kind: "table", internal: true}:        {},
+	{catalog: "system", schema: "main", name: "read_csv", kind: "table", internal: true}:     {},
+	{catalog: "system", schema: "main", name: "read_json", kind: "table", internal: true}:    {},
+	{catalog: "system", schema: "main", name: "read_parquet", kind: "table", internal: true}: {},
 }
 
 func prepareReadOnly(ctx context.Context, connection any, sqlText string) (*duckdb.Stmt, error) {
@@ -98,52 +111,105 @@ func proveSingleSelect(ctx context.Context, connection *duckdb.Conn, sqlText str
 		}
 		metadata, metadataErr := connection.QueryContext(ctx, `
 			SELECT
+				lower(database_name),
+				lower(schema_name),
+				lower(function_type),
+				coalesce(lower(alias_of), ''),
+				internal,
 				count(*),
 				count(has_side_effects),
 				coalesce(bool_or(has_side_effects), false)
 			FROM duckdb_functions()
-			WHERE function_name = ?::VARCHAR
+			WHERE lower(function_name) = ?::VARCHAR
+				AND (?::VARCHAR = '' OR lower(database_name) = ?::VARCHAR)
+				AND (?::VARCHAR = '' OR lower(schema_name) = ?::VARCHAR)
 				AND CASE
 					WHEN ?::VARCHAR = 'table' THEN function_type IN ('table', 'table_macro')
 					ELSE function_type NOT IN ('table', 'table_macro')
 				END
+			GROUP BY database_name, schema_name, function_type, alias_of, internal
 		`, []driver.NamedValue{
 			{Ordinal: 1, Value: reference.name},
-			{Ordinal: 2, Value: reference.context},
+			{Ordinal: 2, Value: reference.catalog},
+			{Ordinal: 3, Value: reference.catalog},
+			{Ordinal: 4, Value: reference.schema},
+			{Ordinal: 5, Value: reference.schema},
+			{Ordinal: 6, Value: reference.kind},
 		})
 		if metadataErr != nil {
 			return fmt.Errorf("%w: function metadata unavailable", ErrReadOnlyRequired)
 		}
-		values := make([]driver.Value, 3)
-		nextErr := metadata.Next(values)
-		closeErr := metadata.Close()
-		if nextErr != nil || closeErr != nil {
-			return fmt.Errorf("%w: function metadata invalid", ErrReadOnlyRequired)
-		}
-		overloadCount, overloadCountOK := values[0].(int64)
-		knownCount, knownCountOK := values[1].(int64)
-		hasSideEffects, sideEffectsOK := values[2].(bool)
-		if !overloadCountOK || !knownCountOK || !sideEffectsOK || overloadCount == 0 ||
-			hasSideEffects {
-			return ErrReadOnlyRequired
-		}
-		if knownCount != overloadCount {
-			if _, controlled := controlledNullFunctions[reference]; !controlled {
+		identities := make(map[functionIdentity]struct{})
+		for {
+			values := make([]driver.Value, 8)
+			nextErr := metadata.Next(values)
+			if errors.Is(nextErr, io.EOF) {
+				break
+			}
+			if nextErr != nil {
+				_ = metadata.Close()
+				return fmt.Errorf("%w: function metadata invalid", ErrReadOnlyRequired)
+			}
+			identity := functionIdentity{name: reference.name}
+			var identityOK bool
+			identity.catalog, identityOK = values[0].(string)
+			if !identityOK {
+				_ = metadata.Close()
 				return ErrReadOnlyRequired
 			}
+			identity.schema, identityOK = values[1].(string)
+			if !identityOK {
+				_ = metadata.Close()
+				return ErrReadOnlyRequired
+			}
+			identity.kind, identityOK = values[2].(string)
+			if !identityOK {
+				_ = metadata.Close()
+				return ErrReadOnlyRequired
+			}
+			identity.aliasOf, identityOK = values[3].(string)
+			if !identityOK {
+				_ = metadata.Close()
+				return ErrReadOnlyRequired
+			}
+			identity.internal, identityOK = values[4].(bool)
+			overloadCount, overloadCountOK := values[5].(int64)
+			knownCount, knownCountOK := values[6].(int64)
+			hasSideEffects, sideEffectsOK := values[7].(bool)
+			if !identityOK || !overloadCountOK || !knownCountOK || !sideEffectsOK ||
+				overloadCount == 0 || hasSideEffects {
+				_ = metadata.Close()
+				return ErrReadOnlyRequired
+			}
+			identities[identity] = struct{}{}
+			if knownCount != overloadCount {
+				if _, controlled := controlledNullFunctions[identity]; !controlled {
+					_ = metadata.Close()
+					return ErrReadOnlyRequired
+				}
+			}
+		}
+		if closeErr := metadata.Close(); closeErr != nil {
+			return fmt.Errorf("%w: function metadata invalid", ErrReadOnlyRequired)
+		}
+		// The parser carries explicit qualification but does not bind an
+		// unqualified call to a catalog object. Multiple identities therefore
+		// represent ambiguity or shadowing and must fail closed.
+		if len(identities) != 1 {
+			return ErrReadOnlyRequired
 		}
 	}
 	return nil
 }
 
 type astValue struct {
-	value   any
-	context string
+	value any
+	kind  string
 }
 
 func collectFunctions(root any) map[functionReference]struct{} {
 	names := make(map[functionReference]struct{})
-	pending := []astValue{{value: root, context: "expression"}}
+	pending := []astValue{{value: root, kind: "expression"}}
 	for len(pending) > 0 {
 		item := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
@@ -151,20 +217,27 @@ func collectFunctions(root any) map[functionReference]struct{} {
 		case map[string]any:
 			if class, _ := typed["class"].(string); class == "FUNCTION" {
 				if name, _ := typed["function_name"].(string); name != "" {
-					names[functionReference{name: strings.ToLower(name), context: item.context}] = struct{}{}
+					catalog, _ := typed["catalog"].(string)
+					schema, _ := typed["schema"].(string)
+					names[functionReference{
+						catalog: strings.ToLower(catalog),
+						schema:  strings.ToLower(schema),
+						name:    strings.ToLower(name),
+						kind:    item.kind,
+					}] = struct{}{}
 				}
 			}
 			tableFunction, _ := typed["type"].(string)
 			for key, child := range typed {
-				context := "expression"
+				kind := "expression"
 				if tableFunction == "TABLE_FUNCTION" && key == "function" {
-					context = "table"
+					kind = "table"
 				}
-				pending = append(pending, astValue{value: child, context: context})
+				pending = append(pending, astValue{value: child, kind: kind})
 			}
 		case []any:
 			for _, child := range typed {
-				pending = append(pending, astValue{value: child, context: "expression"})
+				pending = append(pending, astValue{value: child, kind: "expression"})
 			}
 		}
 	}
