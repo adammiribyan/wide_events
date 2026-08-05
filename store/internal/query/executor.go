@@ -109,13 +109,23 @@ func (executor *Executor) Validate(ctx context.Context, sqlText string) error {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer connection.Close()
-	return connection.Raw(func(raw any) error {
-		statement, err := prepareReadOnly(ctx, raw, sqlText)
-		if err != nil {
-			return err
+	err = connection.Raw(func(raw any) error {
+		duckConnection, ok := raw.(*duckdb.Conn)
+		if !ok {
+			return ErrUnavailable
 		}
-		return statement.Close()
+		return readOnlyTransaction(ctx, duckConnection, func() error {
+			statement, prepareErr := prepareReadOnly(ctx, raw, sqlText)
+			if prepareErr != nil {
+				return prepareErr
+			}
+			return statement.Close()
+		})
 	})
+	if err != nil && !errors.Is(err, ErrUnavailable) && ctx.Err() == nil {
+		return errors.Join(ErrReadOnlyRequired, err)
+	}
+	return err
 }
 
 func (executor *Executor) Execute(ctx context.Context, request Request, output io.Writer) (meta ResultMeta, err error) {
@@ -164,22 +174,28 @@ func (executor *Executor) Execute(ctx context.Context, request Request, output i
 
 	bounded := newLimitedWriter(output, executor.limits.MaxResponseBytes)
 	err = connection.Raw(func(raw any) error {
-		statement, prepareErr := prepareReadOnly(executionContext, raw, request.SQL)
-		if prepareErr != nil {
-			return prepareErr
+		duckConnection, ok := raw.(*duckdb.Conn)
+		if !ok {
+			return ErrUnavailable
 		}
-		defer statement.Close()
+		return readOnlyTransaction(executionContext, duckConnection, func() error {
+			statement, prepareErr := prepareReadOnly(executionContext, raw, request.SQL)
+			if prepareErr != nil {
+				return prepareErr
+			}
+			defer statement.Close()
 
-		rows, queryErr := statement.QueryContext(executionContext, nil)
-		if queryErr != nil {
-			return queryErr
-		}
-		defer rows.Close()
-		meta.Columns = append([]string(nil), rows.Columns()...)
-		if request.Format == "json" {
-			return executor.writeJSON(executionContext, cancel, bounded, rows, &meta)
-		}
-		return executor.writeCSV(executionContext, cancel, bounded, rows, &meta)
+			rows, queryErr := statement.QueryContext(executionContext, nil)
+			if queryErr != nil {
+				return queryErr
+			}
+			defer rows.Close()
+			meta.Columns = append([]string(nil), rows.Columns()...)
+			if request.Format == "json" {
+				return executor.writeJSON(executionContext, cancel, bounded, rows, &meta)
+			}
+			return executor.writeCSV(executionContext, cancel, bounded, rows, &meta)
+		})
 	})
 	meta.Bytes = bounded.written
 	if errors.Is(err, ErrResultLimit) {

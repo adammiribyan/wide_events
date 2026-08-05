@@ -67,14 +67,10 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 	}
 
 	sqlDB := sql.OpenDB(connector)
-	queryConnections := cfg.QueryActive
-	if queryConnections <= 0 {
-		queryConnections = 2
-	}
 	// The database remains the sole owner of the pool. Reserve one connection
 	// for ingestion and maintenance in addition to the bounded query workers.
-	sqlDB.SetMaxOpenConns(queryConnections + 1)
-	sqlDB.SetMaxIdleConns(queryConnections + 1)
+	sqlDB.SetMaxOpenConns(3)
+	sqlDB.SetMaxIdleConns(3)
 	database := &Database{sql: sqlDB, service: cfg.Service, environment: cfg.Environment}
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()

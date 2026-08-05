@@ -22,3 +22,9 @@ EXPORT DATABASE '/tmp/export'
 ATTACH '/tmp/other.db'
 ----
 COPY wide_events TO '/tmp/events.csv'
+----
+SELECT nextval('query_policy_sequence')
+----
+SELECT * FROM query('DELETE FROM wide_events RETURNING id')
+----
+SELECT * FROM query('SELECT nextval(''query_policy_sequence'')')

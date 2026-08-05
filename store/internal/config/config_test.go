@@ -43,10 +43,10 @@ func TestLoadAcceptsExplicitLimits(t *testing.T) {
 		"WIDE_EVENTS_WRITER_QUEUE_BYTES": "1024",
 		"WIDE_EVENTS_FREE_FLOOR_BYTES":   "2048",
 		"WIDE_EVENTS_QUERY_TEMP_BYTES":   "4096",
-		"WIDE_EVENTS_QUERY_ACTIVE":       "3",
-		"WIDE_EVENTS_QUERY_WAITING":      "5",
-		"WIDE_EVENTS_QUERY_TIMEOUT":      "3s",
-		"WIDE_EVENTS_QUERY_WAIT_TIMEOUT": "750ms",
+		"WIDE_EVENTS_QUERY_ACTIVE":       "2",
+		"WIDE_EVENTS_QUERY_WAITING":      "4",
+		"WIDE_EVENTS_QUERY_TIMEOUT":      "15s",
+		"WIDE_EVENTS_QUERY_WAIT_TIMEOUT": "2s",
 	}))
 	require.NoError(t, err)
 	assert.Equal(t, "127.0.0.1:9000", cfg.Listen)
@@ -55,10 +55,33 @@ func TestLoadAcceptsExplicitLimits(t *testing.T) {
 	assert.Equal(t, int64(1024), cfg.WriterQueueBytes)
 	assert.Equal(t, int64(2048), cfg.FreeFloorBytes)
 	assert.Equal(t, int64(4096), cfg.QueryTempBytes)
-	assert.Equal(t, 3, cfg.QueryActive)
-	assert.Equal(t, 5, cfg.QueryWaiting)
-	assert.Equal(t, 3*time.Second, cfg.QueryTimeout)
-	assert.Equal(t, 750*time.Millisecond, cfg.QueryWaitTimeout)
+	assert.Equal(t, 2, cfg.QueryActive)
+	assert.Equal(t, 4, cfg.QueryWaiting)
+	assert.Equal(t, 15*time.Second, cfg.QueryTimeout)
+	assert.Equal(t, 2*time.Second, cfg.QueryWaitTimeout)
+}
+
+func TestLoadRejectsQueryLimitOverrides(t *testing.T) {
+	valid := map[string]string{
+		"WIDE_EVENTS_DATABASE":     "/data/events.duckdb",
+		"WIDE_EVENTS_SERVICE":      "billing",
+		"WIDE_EVENTS_ENVIRONMENT":  "production",
+		"WIDE_EVENTS_INGEST_TOKEN": strings.Repeat("a", 64),
+		"WIDE_EVENTS_QUERY_TOKEN":  strings.Repeat("b", 64),
+	}
+	for name, value := range map[string]string{
+		"WIDE_EVENTS_QUERY_ACTIVE":       "3",
+		"WIDE_EVENTS_QUERY_WAITING":      "5",
+		"WIDE_EVENTS_QUERY_TIMEOUT":      "16s",
+		"WIDE_EVENTS_QUERY_WAIT_TIMEOUT": "3s",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := clone(valid)
+			env[name] = value
+			_, err := Load(mapEnv(env))
+			assert.Error(t, err)
+		})
+	}
 }
 
 func TestLoadRejectsRequiredAndUnsafeSettings(t *testing.T) {

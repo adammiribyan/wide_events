@@ -91,6 +91,10 @@ func Load(getenv func(string) string) (Config, error) {
 	if cfg.QueryWaitTimeout, err = positiveDuration(getenv, "WIDE_EVENTS_QUERY_WAIT_TIMEOUT", cfg.QueryWaitTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.QueryActive != defaultQueryActive || cfg.QueryWaiting != defaultQueryWaiting ||
+		cfg.QueryTimeout != defaultQueryTimeout || cfg.QueryWaitTimeout != defaultQueryWaitTimeout {
+		return Config{}, fmt.Errorf("query limits are fixed at 2 active, 4 waiting, 15s execution, and 2s wait")
+	}
 
 	return cfg, nil
 }

@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
@@ -71,7 +72,75 @@ func proveSingleSelect(ctx context.Context, connection *duckdb.Conn, sqlText str
 	if failed || !ok || len(statements) != 1 {
 		return ErrReadOnlyRequired
 	}
+	functionNames := collectFunctions(statements[0])
+	for functionName := range functionNames {
+		if functionName == "query" {
+			// DuckDB's dynamic query table function is catalogued as pure, but
+			// can tunnel calls to side-effecting functions in its SQL string.
+			return ErrReadOnlyRequired
+		}
+		metadata, metadataErr := connection.QueryContext(ctx, `
+			SELECT count(*), coalesce(bool_or(has_side_effects), false)
+			FROM duckdb_functions()
+			WHERE function_name = ?::VARCHAR
+		`, []driver.NamedValue{{Ordinal: 1, Value: functionName}})
+		if metadataErr != nil {
+			return fmt.Errorf("%w: function metadata unavailable", ErrReadOnlyRequired)
+		}
+		values := make([]driver.Value, 2)
+		nextErr := metadata.Next(values)
+		closeErr := metadata.Close()
+		if nextErr != nil || closeErr != nil {
+			return fmt.Errorf("%w: function metadata invalid", ErrReadOnlyRequired)
+		}
+		count, countOK := values[0].(int64)
+		hasSideEffects, sideEffectsOK := values[1].(bool)
+		if !countOK || !sideEffectsOK || count == 0 || hasSideEffects {
+			return ErrReadOnlyRequired
+		}
+	}
 	return nil
+}
+
+func collectFunctions(root any) map[string]struct{} {
+	names := make(map[string]struct{})
+	pending := []any{root}
+	for len(pending) > 0 {
+		value := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		switch typed := value.(type) {
+		case map[string]any:
+			if class, _ := typed["class"].(string); class == "FUNCTION" {
+				if name, _ := typed["function_name"].(string); name != "" {
+					names[strings.ToLower(name)] = struct{}{}
+				}
+			}
+			for _, child := range typed {
+				pending = append(pending, child)
+			}
+		case []any:
+			pending = append(pending, typed...)
+		}
+	}
+	return names
+}
+
+func readOnlyTransaction(ctx context.Context, connection *duckdb.Conn, operation func() error) (err error) {
+	if _, err := connection.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY", nil); err != nil {
+		return fmt.Errorf("%w: begin read-only transaction: %v", ErrUnavailable, err)
+	}
+	defer func() {
+		_, rollbackErr := connection.ExecContext(context.Background(), "ROLLBACK", nil)
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("%w: rollback read-only transaction: %v", ErrUnavailable, rollbackErr)
+			if err == nil {
+				err = rollbackErr
+			} else {
+				err = errors.Join(err, rollbackErr)
+			}
+		}
+	}()
+	return operation()
 }
 
 func allowed(statementType duckdb.StmtType) bool {

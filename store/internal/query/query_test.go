@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	"github.com/adammiribyan/wide_events/store/internal/storage"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +81,116 @@ func TestPolicyReliesOnLockedExternalAccessSettings(t *testing.T) {
 			assert.NotErrorIs(t, err, ErrReadOnlyRequired)
 		})
 	}
+}
+
+func TestPolicyRejectsSideEffectsBeforeTheyChangeState(t *testing.T) {
+	database := openQueryTestDatabase(t)
+	connection, err := database.QueryConnection(context.Background())
+	require.NoError(t, err)
+	_, err = connection.ExecContext(context.Background(), "CREATE TABLE query_policy_victim(value INTEGER)")
+	require.NoError(t, err)
+	_, err = connection.ExecContext(context.Background(), "INSERT INTO query_policy_victim VALUES (1)")
+	require.NoError(t, err)
+	_, err = connection.ExecContext(context.Background(), "CREATE SEQUENCE query_policy_sequence START 41")
+	require.NoError(t, err)
+	require.NoError(t, connection.Close())
+
+	executor := NewExecutor(database, Limits{}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	for _, statement := range []string{
+		"SELECT nextval('query_policy_sequence')",
+		"SELECT * FROM query('DELETE FROM query_policy_victim RETURNING value')",
+		"SELECT * FROM query('SELECT nextval(''query_policy_sequence'')')",
+	} {
+		t.Run(statement, func(t *testing.T) {
+			assert.ErrorIs(t, executor.Validate(context.Background(), statement), ErrReadOnlyRequired)
+		})
+	}
+
+	connection, err = database.QueryConnection(context.Background())
+	require.NoError(t, err)
+	defer connection.Close()
+	var rows int
+	require.NoError(t, connection.QueryRowContext(context.Background(), "SELECT count(*) FROM query_policy_victim").Scan(&rows))
+	assert.Equal(t, 1, rows)
+	var sequenceValue int64
+	require.NoError(t, connection.QueryRowContext(context.Background(), "SELECT nextval('query_policy_sequence')").Scan(&sequenceValue))
+	assert.Equal(t, int64(41), sequenceValue)
+	_, err = connection.ExecContext(context.Background(), "SET lock_configuration = false")
+	assert.Error(t, err)
+}
+
+func TestPinnedDuckDBSideEffectFunctionCharacterization(t *testing.T) {
+	database := openQueryTestDatabase(t)
+	connection, err := database.QueryConnection(context.Background())
+	require.NoError(t, err)
+	defer connection.Close()
+	rows, err := connection.QueryContext(context.Background(), `
+		SELECT DISTINCT function_name
+		FROM duckdb_functions()
+		WHERE has_side_effects
+		ORDER BY function_name
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var actual []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		actual = append(actual, name)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{
+		"current_connection_id", "current_query", "current_query_id", "current_transaction_id",
+		"currval", "error", "gen_random_uuid", "nextval", "random", "setseed", "sleep_ms",
+		"stats", "uuid", "uuidv4", "uuidv7", "write_log",
+	}, actual)
+
+	var disabledFunctionsSettings int
+	require.NoError(t, connection.QueryRowContext(context.Background(), `
+		SELECT count(*) FROM duckdb_settings() WHERE name = 'disabled_functions'
+	`).Scan(&disabledFunctionsSettings))
+	assert.Zero(t, disabledFunctionsSettings)
+
+	var dynamicQuerySideEffects bool
+	require.NoError(t, connection.QueryRowContext(context.Background(), `
+		SELECT coalesce(has_side_effects, false)
+		FROM duckdb_functions()
+		WHERE function_name = 'query' AND function_type = 'table'
+	`).Scan(&dynamicQuerySideEffects))
+	assert.False(t, dynamicQuerySideEffects)
+}
+
+func TestReadOnlyTransactionBlocksDirectAndDynamicSequenceMutation(t *testing.T) {
+	database := openQueryTestDatabase(t)
+	connection, err := database.QueryConnection(context.Background())
+	require.NoError(t, err)
+	defer connection.Close()
+	_, err = connection.ExecContext(context.Background(), "CREATE SEQUENCE read_only_guard_sequence START 41")
+	require.NoError(t, err)
+
+	err = connection.Raw(func(raw any) error {
+		duckConnection := raw.(*duckdb.Conn)
+		for _, statement := range []string{
+			"SELECT nextval('read_only_guard_sequence')",
+			"SELECT * FROM query('SELECT nextval(''read_only_guard_sequence'')')",
+		} {
+			executionErr := readOnlyTransaction(context.Background(), duckConnection, func() error {
+				rows, queryErr := duckConnection.QueryContext(context.Background(), statement, nil)
+				if rows != nil {
+					_ = rows.Close()
+				}
+				return queryErr
+			})
+			if executionErr == nil {
+				return fmt.Errorf("read-only transaction admitted %q", statement)
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	var sequenceValue int64
+	require.NoError(t, connection.QueryRowContext(context.Background(), "SELECT nextval('read_only_guard_sequence')").Scan(&sequenceValue))
+	assert.Equal(t, int64(41), sequenceValue)
 }
 
 func TestFifthWaiterGetsBusyWithoutEnteringActivePool(t *testing.T) {
@@ -206,6 +318,68 @@ func TestResultByteLimitStopsBeforeCrossingBound(t *testing.T) {
 	assert.Equal(t, int64(output.Len()), meta.Bytes)
 	var decoded any
 	assert.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
+}
+
+func TestDefaultResponseByteBoundary(t *testing.T) {
+	executor := newTestExecutor(t, Limits{})
+	for _, format := range []string{"json", "csv"} {
+		t.Run(format, func(t *testing.T) {
+			base := len("value\n\n")
+			if format == "json" {
+				base = len(`{"columns":["value"],"rows":[[""]],"truncated":false}` + "\n")
+			}
+			valueBytes := defaultMaxResponseBytes - int64(base)
+
+			var exact bytes.Buffer
+			meta, err := executor.Execute(context.Background(), Request{
+				ProtocolVersion: 1,
+				SQL:             fmt.Sprintf("SELECT repeat('x', %d) AS value", valueBytes),
+				Format:          format,
+			}, &exact)
+			require.NoError(t, err)
+			assert.Equal(t, defaultMaxResponseBytes, meta.Bytes)
+			assert.Equal(t, int(defaultMaxResponseBytes), exact.Len())
+
+			var over bytes.Buffer
+			meta, err = executor.Execute(context.Background(), Request{
+				ProtocolVersion: 1,
+				SQL:             fmt.Sprintf("SELECT repeat('x', %d) AS value", valueBytes+1),
+				Format:          format,
+			}, &over)
+			assert.ErrorIs(t, err, ErrResultLimit)
+			assert.True(t, meta.Truncated)
+			assert.LessOrEqual(t, meta.Bytes, defaultMaxResponseBytes)
+			assert.LessOrEqual(t, int64(over.Len()), defaultMaxResponseBytes)
+			if format == "json" {
+				var decoded any
+				assert.NoError(t, json.Unmarshal(over.Bytes(), &decoded))
+			}
+		})
+	}
+}
+
+func TestDefaultRowBoundary(t *testing.T) {
+	executor := newTestExecutor(t, Limits{})
+	for _, rowCount := range []int{defaultMaxRows, defaultMaxRows + 1} {
+		t.Run(fmt.Sprintf("rows_%d", rowCount), func(t *testing.T) {
+			var output bytes.Buffer
+			meta, err := executor.Execute(context.Background(), Request{
+				ProtocolVersion: 1,
+				SQL:             fmt.Sprintf("SELECT i FROM range(%d) AS values(i)", rowCount),
+				Format:          "json",
+			}, &output)
+			assert.Equal(t, defaultMaxRows, meta.Rows)
+			if rowCount == defaultMaxRows {
+				require.NoError(t, err)
+				assert.False(t, meta.Truncated)
+			} else {
+				assert.ErrorIs(t, err, ErrResultLimit)
+				assert.True(t, meta.Truncated)
+			}
+			var decoded any
+			assert.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
+		})
+	}
 }
 
 func TestResultNormalizationIsDeterministic(t *testing.T) {

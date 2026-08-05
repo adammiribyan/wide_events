@@ -64,12 +64,7 @@ func New(cfg config.Config, dependencies Dependencies) http.Handler {
 	}
 	queries := dependencies.Query
 	if queries == nil {
-		queries = query.NewExecutor(dependencies.Database, query.Limits{
-			Active:           cfg.QueryActive,
-			Waiting:          cfg.QueryWaiting,
-			WaitTimeout:      cfg.QueryWaitTimeout,
-			ExecutionTimeout: cfg.QueryTimeout,
-		}, logger)
+		queries = query.NewExecutor(dependencies.Database, query.Limits{}, logger)
 	}
 	api := &server{
 		config:   cfg,
