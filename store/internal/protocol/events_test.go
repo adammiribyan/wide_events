@@ -77,14 +77,14 @@ func TestDecodeBatchRejectsTrailingJSON(t *testing.T) {
 func TestDecodeBatchEnforcesEventAndAttributeBoundaries(t *testing.T) {
 	t.Run("events", func(t *testing.T) {
 		atLimit := validBatch()
-		atLimit["events"] = repeatedEvents(MaxEvents)
+		atLimit["events"] = repeatedEvents(100)
 		_, _, err := DecodeBatch(strings.NewReader(marshalJSON(t, atLimit)))
 		assert.NoError(t, err)
 
 		overLimit := validBatch()
-		overLimit["events"] = repeatedEvents(MaxEvents + 1)
+		overLimit["events"] = repeatedEvents(101)
 		_, _, err = DecodeBatch(strings.NewReader(marshalJSON(t, overLimit)))
-		assert.Error(t, err)
+		assert.ErrorIs(t, err, ErrTooManyEvents)
 	})
 
 	t.Run("attributes", func(t *testing.T) {
@@ -99,6 +99,18 @@ func TestDecodeBatchEnforcesEventAndAttributeBoundaries(t *testing.T) {
 		_, _, err = DecodeBatch(strings.NewReader(batchJSON(atLimit)))
 		assert.Error(t, err)
 	})
+}
+
+func TestDecodeBatchEnforcesCanonicalBatchByteBoundary(t *testing.T) {
+	atLimit := batchJSONAtCanonicalBytes(t, 1<<20)
+	_, canonical, err := DecodeBatch(strings.NewReader(atLimit))
+	require.NoError(t, err)
+	assert.Len(t, canonical, 1<<20)
+
+	overLimit := batchJSONAtCanonicalBytes(t, (1<<20)+1)
+	_, canonical, err = DecodeBatch(strings.NewReader(overLimit))
+	assert.Error(t, err)
+	assert.Empty(t, canonical)
 }
 
 func TestDecodeBatchEnforcesCanonicalEventAndDecodedBodyBoundaries(t *testing.T) {
@@ -128,6 +140,18 @@ func TestDecodeBatchRequiresDurationForEachV1Kind(t *testing.T) {
 	}
 }
 
+func TestDecodeBatchAcceptsUppercaseUUIDs(t *testing.T) {
+	batch := validBatch()
+	batch["batch_id"] = strings.ToUpper(batch["batch_id"].(string))
+	event := batch["events"].([]any)[0].(map[string]any)
+	event["id"] = strings.ToUpper(event["id"].(string))
+	batch["dropped_events_since_last_batch"] = 1
+	batch["loss_report_id"] = "018F6F50-2F9D-7FB0-A258-6D9F95F20C03"
+
+	_, _, err := DecodeBatch(strings.NewReader(marshalJSON(t, batch)))
+	assert.NoError(t, err)
+}
+
 func validBatch() map[string]any {
 	return map[string]any{
 		"protocol_version":                ProtocolVersion,
@@ -154,6 +178,31 @@ func repeatedEvents(count int) []any {
 		events[index] = event
 	}
 	return events
+}
+
+func batchJSONAtCanonicalBytes(t *testing.T, byteCount int) string {
+	t.Helper()
+	batch := validBatch()
+	events := repeatedEvents(100)
+	batch["events"] = events
+	for _, value := range events {
+		value.(map[string]any)["attributes"] = map[string]any{"payload": ""}
+	}
+
+	base := marshalJSON(t, batch)
+	remaining := byteCount - len(base)
+	require.Positive(t, remaining)
+	for index, value := range events {
+		payloadBytes := remaining / len(events)
+		if index < remaining%len(events) {
+			payloadBytes++
+		}
+		value.(map[string]any)["attributes"] = map[string]any{"payload": strings.Repeat("x", payloadBytes)}
+	}
+
+	encoded := marshalJSON(t, batch)
+	require.Len(t, encoded, byteCount)
+	return encoded
 }
 
 func batchJSON(attributes map[string]any) string {

@@ -15,9 +15,10 @@ import (
 
 const (
 	ProtocolVersion     = 1
-	MaxEvents           = 500
+	MaxEvents           = 100
 	MaxAttributes       = 256
 	MaxEventBytes       = 64 << 10
+	MaxBatchBytes       = 1 << 20
 	MaxDecodedBodyBytes = 2 << 20
 )
 
@@ -32,6 +33,7 @@ var (
 	ErrTooManyEvents       = errors.New("too many events")
 	ErrTooManyAttributes   = errors.New("too many attributes")
 	ErrEventTooLarge       = errors.New("event exceeds size limit")
+	ErrBatchTooLarge       = errors.New("batch exceeds size limit")
 	ErrInvalidLossReport   = errors.New("invalid loss report")
 )
 
@@ -116,6 +118,9 @@ func DecodeBatch(reader io.Reader) (Batch, []byte, error) {
 	canonical, err := json.Marshal(batch)
 	if err != nil {
 		return Batch{}, nil, fmt.Errorf("marshal canonical batch: %w", err)
+	}
+	if len(canonical) > MaxBatchBytes {
+		return Batch{}, nil, validation("batch", ErrBatchTooLarge)
 	}
 	return batch, canonical, nil
 }
@@ -205,8 +210,8 @@ func normalizeAttribute(value any) (any, error) {
 }
 
 func validUUID(value string) bool {
-	parsed, err := uuid.Parse(value)
-	return err == nil && parsed.String() == strings.ToLower(value)
+	_, err := uuid.Parse(value)
+	return err == nil
 }
 
 func validation(field string, err error) error {
