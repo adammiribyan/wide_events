@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -13,6 +14,7 @@ import (
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	"github.com/adammiribyan/wide_events/store/internal/protocol"
 	"github.com/adammiribyan/wide_events/store/internal/storage"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,10 +28,10 @@ func TestQueueRejectsCanonicalBytesBeyondItsLimit(t *testing.T) {
 	_, err := writer.Submit(context.Background(), batch, canonical)
 	assert.ErrorIs(t, err, ErrQueueFull)
 
-	status, statusErr := database.Status(context.Background())
-	require.NoError(t, statusErr)
-	assert.Equal(t, uint64(1), status.RejectedBatches)
-	assert.Zero(t, status.QueuedIngestBytes)
+	require.Eventually(t, func() bool {
+		status, statusErr := database.Status(context.Background())
+		return statusErr == nil && status.RejectedBatches == 1 && status.QueuedIngestBytes == 0
+	}, 5*time.Second, time.Millisecond)
 }
 
 func TestQueueAcceptsExactCanonicalByteLimitAndAcknowledgesCommit(t *testing.T) {
@@ -45,9 +47,10 @@ func TestQueueAcceptsExactCanonicalByteLimitAndAcknowledgesCommit(t *testing.T) 
 
 	assert.False(t, first.Duplicate)
 	assert.True(t, second.Duplicate)
-	status, err := database.Status(context.Background())
-	require.NoError(t, err)
-	assert.Zero(t, status.QueuedIngestBytes)
+	require.Eventually(t, func() bool {
+		status, statusErr := database.Status(context.Background())
+		return statusErr == nil && status.QueuedIngestBytes == 0
+	}, 5*time.Second, time.Millisecond)
 }
 
 func TestQueueRejectsEmptyCanonicalCharge(t *testing.T) {
@@ -138,6 +141,93 @@ func TestNoSpaceCommitErrorIsTypedForHTTPMapping(t *testing.T) {
 	_, err := writer.Submit(context.Background(), batch, canonical)
 	assert.ErrorIs(t, err, ErrInsufficientStorage)
 	assert.ErrorIs(t, err, syscall.ENOSPC)
+}
+
+func TestDuckDBIOCommitErrorIsTypedForHTTPMapping(t *testing.T) {
+	batch, canonical := validBatch(t)
+	database := newBlockingDatabase()
+	database.commitErr = &duckdb.Error{
+		Type: duckdb.ErrorTypeIO,
+		Msg:  "IO Error: failed to write database block",
+	}
+	close(database.release)
+	writer := newWriter(database, int64(len(canonical)))
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+
+	_, err := writer.Submit(context.Background(), batch, canonical)
+	assert.ErrorIs(t, err, ErrInsufficientStorage)
+	var databaseError *duckdb.Error
+	assert.ErrorAs(t, err, &databaseError)
+	assert.Equal(t, duckdb.ErrorTypeIO, databaseError.Type)
+}
+
+func TestTelemetryCoalescesWithoutBlockingQueueAdmission(t *testing.T) {
+	batch, canonical := validBatch(t)
+	database := newTelemetryBlockingDatabase()
+	writer := newWriter(database, int64(2*len(canonical)))
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+
+	go func() {
+		_, err := writer.Submit(context.Background(), batch, canonical)
+		first <- err
+	}()
+	<-database.commitStarted
+	go func() {
+		_, err := writer.Submit(context.Background(), batch, canonical)
+		second <- err
+	}()
+	waitForQueuedBytes(t, writer, int64(2*len(canonical)))
+
+	rejected := make(chan error, 1)
+	go func() {
+		_, err := writer.Submit(context.Background(), batch, canonical)
+		rejected <- err
+	}()
+	var rejectionPrompt bool
+	select {
+	case err := <-rejected:
+		rejectionPrompt = errors.Is(err, ErrQueueFull)
+	case <-time.After(250 * time.Millisecond):
+	}
+	gaugePublished := database.waitForQueued(int64(2*len(canonical)), 250*time.Millisecond)
+
+	close(database.telemetryRelease)
+	close(database.commitRelease)
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+	require.NoError(t, writer.Close(context.Background()))
+	assert.True(t, rejectionPrompt, "queue rejection waited for telemetry storage")
+	assert.True(t, gaugePublished, "aggregate queued bytes were not offered while commit was in flight")
+	database.mutex.Lock()
+	defer database.mutex.Unlock()
+	assert.Equal(t, uint64(1), database.rejected)
+	assert.Zero(t, database.queued[len(database.queued)-1])
+}
+
+func TestTelemetryRetriesTransientFailuresWithoutAnotherAdmission(t *testing.T) {
+	batch, canonical := validBatch(t)
+	database := &flakyTelemetryDatabase{queueFailures: 1, rejectionFailures: 1}
+	writer := newWriter(database, int64(len(canonical)-1))
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+
+	_, err := writer.Submit(context.Background(), batch, canonical)
+	assert.ErrorIs(t, err, ErrQueueFull)
+	require.Eventually(t, func() bool {
+		database.mutex.Lock()
+		defer database.mutex.Unlock()
+		return database.rejected == 1 && len(database.queued) > 0 && database.queued[len(database.queued)-1] == 0
+	}, time.Second, time.Millisecond)
+}
+
+func TestCloseReportsPermanentTelemetryFlushFailure(t *testing.T) {
+	batch, canonical := validBatch(t)
+	database := &flakyTelemetryDatabase{queueFailures: 1000, rejectionFailures: 1000}
+	writer := newWriter(database, int64(len(canonical)-1))
+
+	_, err := writer.Submit(context.Background(), batch, canonical)
+	assert.ErrorIs(t, err, ErrQueueFull)
+	assert.Error(t, writer.Close(context.Background()))
 }
 
 func openTestDatabase(t *testing.T) *storage.Database {
@@ -243,4 +333,92 @@ func waitForQueuedBytes(t *testing.T, writer *Writer, expected int64) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("queued bytes did not reach %d", expected)
+}
+
+type telemetryBlockingDatabase struct {
+	mutex            sync.Mutex
+	commitStarted    chan struct{}
+	commitRelease    chan struct{}
+	telemetryRelease chan struct{}
+	queued           []int64
+	rejected         uint64
+}
+
+func newTelemetryBlockingDatabase() *telemetryBlockingDatabase {
+	return &telemetryBlockingDatabase{
+		commitStarted:    make(chan struct{}, 1),
+		commitRelease:    make(chan struct{}),
+		telemetryRelease: make(chan struct{}),
+	}
+}
+
+func (database *telemetryBlockingDatabase) CommitBatch(context.Context, protocol.Batch) (storage.CommitResult, error) {
+	database.commitStarted <- struct{}{}
+	<-database.commitRelease
+	return storage.CommitResult{}, nil
+}
+
+func (database *telemetryBlockingDatabase) SetQueuedIngestBytes(_ context.Context, queued int64) error {
+	database.mutex.Lock()
+	database.queued = append(database.queued, queued)
+	database.mutex.Unlock()
+	return nil
+}
+
+func (database *telemetryBlockingDatabase) AddRejectedBatches(_ context.Context, count uint64) error {
+	<-database.telemetryRelease
+	database.mutex.Lock()
+	database.rejected += count
+	database.mutex.Unlock()
+	return nil
+}
+
+func (database *telemetryBlockingDatabase) waitForQueued(expected int64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		database.mutex.Lock()
+		for _, queued := range database.queued {
+			if queued == expected {
+				database.mutex.Unlock()
+				return true
+			}
+		}
+		database.mutex.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+type flakyTelemetryDatabase struct {
+	mutex             sync.Mutex
+	queueFailures     int
+	rejectionFailures int
+	queued            []int64
+	rejected          uint64
+}
+
+func (database *flakyTelemetryDatabase) CommitBatch(context.Context, protocol.Batch) (storage.CommitResult, error) {
+	return storage.CommitResult{}, nil
+}
+
+func (database *flakyTelemetryDatabase) SetQueuedIngestBytes(_ context.Context, queued int64) error {
+	database.mutex.Lock()
+	defer database.mutex.Unlock()
+	if database.queueFailures > 0 {
+		database.queueFailures--
+		return errors.New("transient queue telemetry failure")
+	}
+	database.queued = append(database.queued, queued)
+	return nil
+}
+
+func (database *flakyTelemetryDatabase) AddRejectedBatches(_ context.Context, count uint64) error {
+	database.mutex.Lock()
+	defer database.mutex.Unlock()
+	if database.rejectionFailures > 0 {
+		database.rejectionFailures--
+		return errors.New("transient rejection telemetry failure")
+	}
+	database.rejected += count
+	return nil
 }

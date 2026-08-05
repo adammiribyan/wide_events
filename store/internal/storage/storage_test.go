@@ -92,6 +92,32 @@ func TestCommitBatchRollsBackLedgerAndEventsOnFailure(t *testing.T) {
 	assert.Equal(t, 1, queryInt(t, db, "SELECT count(*) FROM wide_events"))
 }
 
+func TestCommitBatchCountsTenancyMismatchTransactionallyAcrossFailureAndRetry(t *testing.T) {
+	db := openTestDatabase(t)
+	batch := validBatch("018f6f50-2f9d-7fb0-a258-6d9f95f20c0a")
+	batch.Events[0].Attributes["invalid"] = func() {}
+
+	failed, err := db.CommitBatch(context.Background(), batch)
+	require.Error(t, err)
+	assert.False(t, failed.TenancyMismatch)
+	status, statusErr := db.Status(context.Background())
+	require.NoError(t, statusErr)
+	assert.Zero(t, status.TenancyMismatches)
+
+	delete(batch.Events[0].Attributes, "invalid")
+	first, err := db.CommitBatch(context.Background(), batch)
+	require.NoError(t, err)
+	second, err := db.CommitBatch(context.Background(), batch)
+	require.NoError(t, err)
+	assert.True(t, first.TenancyMismatch)
+	assert.False(t, first.Duplicate)
+	assert.True(t, second.TenancyMismatch)
+	assert.True(t, second.Duplicate)
+	status, err = db.Status(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), status.TenancyMismatches)
+}
+
 func TestCommitBatchPromotesColumnsAndOverridesPayloadTenancy(t *testing.T) {
 	db := openTestDatabase(t)
 	batch := validBatch("018f6f50-2f9d-7fb0-a258-6d9f95f20c04")

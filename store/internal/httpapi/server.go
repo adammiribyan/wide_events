@@ -21,6 +21,10 @@ type submitter interface {
 	Submit(context.Context, protocol.Batch, []byte) (storage.CommitResult, error)
 }
 
+type tenancyLoggingConfigurer interface {
+	ConfigureTenancyLogging(*slog.Logger, string, string)
+}
+
 // Dependencies are the owned process resources used by the HTTP routes.
 type Dependencies struct {
 	Database *storage.Database
@@ -32,8 +36,13 @@ type server struct {
 	config   config.Config
 	database *storage.Database
 	writer   submitter
-	logger   *slog.Logger
 	decoders chan struct{}
+}
+
+type healthResponse struct {
+	ProtocolVersion   int    `json:"protocol_version"`
+	WriteReady        bool   `json:"write_ready"`
+	DegradationReason string `json:"degradation_reason"`
 }
 
 // New builds the public HTTP routes without starting a listener.
@@ -42,11 +51,13 @@ func New(cfg config.Config, dependencies Dependencies) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if configurable, ok := dependencies.Writer.(tenancyLoggingConfigurer); ok {
+		configurable.ConfigureTenancyLogging(logger, cfg.Service, cfg.Environment)
+	}
 	api := &server{
 		config:   cfg,
 		database: dependencies.Database,
 		writer:   dependencies.Writer,
-		logger:   logger,
 		decoders: make(chan struct{}, maxConcurrentDecodes),
 	}
 	mux := http.NewServeMux()
@@ -127,21 +138,8 @@ func (server *server) ingest(response http.ResponseWriter, request *http.Request
 	}
 
 	warnings := []string{}
-	if batch.Service != server.config.Service || batch.Environment != server.config.Environment {
+	if result.TenancyMismatch {
 		warnings = append(warnings, "client service/environment differs from store configuration")
-		if !result.Duplicate {
-			if err := server.database.AddTenancyMismatches(context.Background(), 1); err != nil {
-				server.logger.Error("record tenancy mismatch", "error", err)
-				writeError(response, http.StatusServiceUnavailable)
-				return
-			}
-			server.logger.Warn("ingest tenancy mismatch",
-				"expected_service", server.config.Service,
-				"received_service", batch.Service,
-				"expected_environment", server.config.Environment,
-				"received_environment", batch.Environment,
-			)
-		}
 	}
 
 	writeJSON(response, http.StatusOK, protocol.Ack{
@@ -155,14 +153,14 @@ func (server *server) ingest(response http.ResponseWriter, request *http.Request
 func (server *server) health(response http.ResponseWriter, request *http.Request) {
 	writeReady, degradationReason, err := server.database.WriteStatus(request.Context())
 	if err != nil {
-		writeError(response, http.StatusServiceUnavailable)
+		writeJSON(response, http.StatusServiceUnavailable, healthResponse{
+			ProtocolVersion:   protocol.ProtocolVersion,
+			WriteReady:        false,
+			DegradationReason: "database_unavailable",
+		})
 		return
 	}
-	writeJSON(response, http.StatusOK, struct {
-		ProtocolVersion   int    `json:"protocol_version"`
-		WriteReady        bool   `json:"write_ready"`
-		DegradationReason string `json:"degradation_reason"`
-	}{
+	writeJSON(response, http.StatusOK, healthResponse{
 		ProtocolVersion:   protocol.ProtocolVersion,
 		WriteReady:        writeReady,
 		DegradationReason: degradationReason,

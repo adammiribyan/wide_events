@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -169,6 +170,32 @@ func TestTenancyMismatchWarnsLogsAndIncrementsCounter(t *testing.T) {
 	assert.Contains(t, logOutput, "production")
 	assert.NotContains(t, logOutput, testIngestToken)
 	assert.Equal(t, 1, strings.Count(logOutput, "ingest tenancy mismatch"))
+}
+
+func TestTenancyMismatchCountSurvivesFailureAfterCommitAndWarnsOnRetry(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	writer := ingest.NewWriter(database, 32<<20)
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+	submitter := &responseLossSubmitter{inner: writer}
+	logs := &bytes.Buffer{}
+	handler := New(testConfig(), Dependencies{
+		Database: database,
+		Writer:   submitter,
+		Logger:   slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	body := validBatchJSON(t, "billing", "production")
+
+	first := postEvents(t, handler, "Bearer "+testIngestToken, body, "")
+	second := postEvents(t, handler, "Bearer "+testIngestToken, body, "")
+	assert.Equal(t, http.StatusServiceUnavailable, first.Code)
+	require.Equal(t, http.StatusOK, second.Code)
+	assert.True(t, decodeAck(t, second).Duplicate)
+	assert.Len(t, decodeAck(t, second).Warnings, 1)
+
+	status, err := database.Status(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), status.TenancyMismatches)
+	assert.Equal(t, 1, strings.Count(logs.String(), "ingest tenancy mismatch"))
 }
 
 func TestDecoderAdmissionIsReleasedBeforeCommitAcknowledgement(t *testing.T) {
@@ -350,4 +377,26 @@ type submitterFunc func(context.Context, protocol.Batch, []byte) (storage.Commit
 
 func (submitter submitterFunc) Submit(ctx context.Context, batch protocol.Batch, canonical []byte) (storage.CommitResult, error) {
 	return submitter(ctx, batch, canonical)
+}
+
+type responseLossSubmitter struct {
+	inner submitter
+	lost  atomic.Bool
+}
+
+func (submitter *responseLossSubmitter) Submit(ctx context.Context, batch protocol.Batch, canonical []byte) (storage.CommitResult, error) {
+	result, err := submitter.inner.Submit(ctx, batch, canonical)
+	if err != nil {
+		return storage.CommitResult{}, err
+	}
+	if submitter.lost.CompareAndSwap(false, true) {
+		return storage.CommitResult{}, errors.New("simulated response loss after commit")
+	}
+	return result, nil
+}
+
+func (submitter *responseLossSubmitter) ConfigureTenancyLogging(logger *slog.Logger, service, environment string) {
+	if configurable, ok := submitter.inner.(tenancyLoggingConfigurer); ok {
+		configurable.ConfigureTenancyLogging(logger, service, environment)
+	}
 }

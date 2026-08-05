@@ -75,19 +75,6 @@ func (database *Database) AddRejectedBatches(ctx context.Context, count uint64) 
 	return nil
 }
 
-// AddTenancyMismatches adds newly observed client/store tenancy drift to the
-// lifetime counter without exposing the store's SQL handle.
-func (database *Database) AddTenancyMismatches(ctx context.Context, count uint64) error {
-	if _, err := database.sql.ExecContext(ctx, `
-		UPDATE wide_events_store_state
-		SET tenancy_mismatches = tenancy_mismatches + ?::UBIGINT
-		WHERE singleton
-	`, strconv.FormatUint(count, 10)); err != nil {
-		return fmt.Errorf("update tenancy mismatch total: %w", err)
-	}
-	return nil
-}
-
 // SetWriteReady publishes whether writes may be admitted and why not.
 func (database *Database) SetWriteReady(ctx context.Context, ready bool, reason string) error {
 	if ready {

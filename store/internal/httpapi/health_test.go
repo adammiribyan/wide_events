@@ -61,4 +61,8 @@ func TestHealthReturnsUnavailableWhenDatabaseCannotServeTraffic(t *testing.T) {
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/up", bytes.NewReader(nil)))
 	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.JSONEq(t, `{"protocol_version":1,"write_ready":false,"degradation_reason":"database_unavailable"}`, response.Body.String())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	assert.Len(t, body, 3)
 }

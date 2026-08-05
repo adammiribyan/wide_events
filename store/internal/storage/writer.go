@@ -13,12 +13,14 @@ import (
 
 // CommitResult reports whether a batch was already committed.
 type CommitResult struct {
-	Duplicate bool
+	Duplicate       bool
+	TenancyMismatch bool
 }
 
 // CommitBatch atomically records a batch ledger entry, its loss report, and all
 // events. A previously committed batch is acknowledged without reinsertion.
 func (database *Database) CommitBatch(ctx context.Context, batch protocol.Batch) (result CommitResult, err error) {
+	tenancyMismatch := batch.Service != database.service || batch.Environment != database.environment
 	tx, err := database.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return CommitResult{}, fmt.Errorf("begin batch transaction: %w", err)
@@ -40,7 +42,7 @@ func (database *Database) CommitBatch(ctx context.Context, batch protocol.Batch)
 		if err = tx.Commit(); err != nil {
 			return CommitResult{}, fmt.Errorf("commit duplicate batch transaction: %w", err)
 		}
-		return CommitResult{Duplicate: true}, nil
+		return CommitResult{Duplicate: true, TenancyMismatch: tenancyMismatch}, nil
 	}
 	if err != nil {
 		return CommitResult{}, fmt.Errorf("record ingestion batch: %w", err)
@@ -86,11 +88,20 @@ func (database *Database) CommitBatch(ctx context.Context, batch protocol.Batch)
 			return CommitResult{}, fmt.Errorf("insert event: %w", err)
 		}
 	}
+	if tenancyMismatch {
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE wide_events_store_state
+			SET tenancy_mismatches = tenancy_mismatches + 1
+			WHERE singleton
+		`); err != nil {
+			return CommitResult{}, fmt.Errorf("update tenancy mismatch total: %w", err)
+		}
+	}
 
 	if err = tx.Commit(); err != nil {
 		return CommitResult{}, fmt.Errorf("commit batch transaction: %w", err)
 	}
-	return CommitResult{}, nil
+	return CommitResult{TenancyMismatch: tenancyMismatch}, nil
 }
 
 func recordLossReport(ctx context.Context, tx *sql.Tx, lossReportID string, dropped uint64) error {
