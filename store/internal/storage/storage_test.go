@@ -3,10 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +18,7 @@ import (
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	"github.com/adammiribyan/wide_events/store/internal/disk"
 	"github.com/adammiribyan/wide_events/store/internal/protocol"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -368,6 +372,52 @@ func TestCreateBackupProducesAReadOnlyVerifiableCopy(t *testing.T) {
 	require.NoError(t, db.CreateBackup(ctx, path))
 	require.FileExists(t, path)
 	require.NoError(t, db.VerifyBackup(ctx, path))
+}
+
+func TestDuckDBHeldDescriptorPathSupportIsCharacterized(t *testing.T) {
+	db := openTestDatabase(t)
+	ctx := context.Background()
+	directory := filepath.Join(filepath.Dir(db.path), "backups")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	path := filepath.Join(directory, "descriptor.duckdb")
+	require.NoError(t, db.CreateBackup(ctx, path))
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	defer file.Close()
+	fdPath := fmt.Sprintf("/dev/fd/%d", file.Fd())
+	if runtime.GOOS == "linux" {
+		fdPath = fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	}
+	connector, err := duckdb.NewConnector(fdPath+"?access_mode=read_only", func(driver.ExecerContext) error { return nil })
+	if runtime.GOOS == "darwin" && err != nil {
+		require.ErrorContains(t, err, `Cannot open database "/dev/fd/descriptor.duckdb" in read-only mode`)
+		return
+	}
+	require.NoError(t, err)
+	copyDatabase := sql.OpenDB(connector)
+	copyDatabase.SetMaxOpenConns(1)
+	defer copyDatabase.Close()
+	pingErr := copyDatabase.PingContext(ctx)
+	if runtime.GOOS == "darwin" {
+		require.ErrorContains(t, pingErr, `Cannot open database "/dev/fd/descriptor.duckdb" in read-only mode`)
+		return
+	}
+	require.NoError(t, pingErr)
+	var rows uint64
+	require.NoError(t, copyDatabase.QueryRowContext(ctx, "SELECT count(*)::UBIGINT FROM wide_events").Scan(&rows))
+}
+
+func TestVerifyBackupFileUsesTheHeldDescriptorStrategyForThisOS(t *testing.T) {
+	db := openTestDatabase(t)
+	ctx := context.Background()
+	directory := filepath.Join(filepath.Dir(db.path), "backups")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	path := filepath.Join(directory, "held.duckdb")
+	require.NoError(t, db.CreateBackup(ctx, path))
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	defer file.Close()
+	require.NoError(t, db.VerifyBackupFile(ctx, path, file))
 }
 
 func TestVerifyBackupRejectsAnInvalidCopy(t *testing.T) {

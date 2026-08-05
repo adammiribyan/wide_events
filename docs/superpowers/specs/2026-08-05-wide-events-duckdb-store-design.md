@@ -542,6 +542,23 @@ the exclusive backup operation runs, while `/up` remains `200` with
 `write_ready: false` so the temporary operation does not remove the service from
 routing.
 
+The local-backup filesystem threat model trusts the store process UID. Its
+filesystem defenses prevent interference by other principals, symlink and
+ancestor-path substitution, accidental name replacement, and incomplete
+publication across crashes. They do not claim protection against an actively
+malicious same-UID process: such a process can already inspect the service's
+tokens, ptrace or signal it, and manipulate its files. Backup operations walk
+from the filesystem root with no-follow directory descriptors, require trusted
+ownership and non-writable ancestors (with only an exact root-owned sticky
+`01777` temporary-directory exception), and perform publication, quarantine,
+and deletion relative to the held backup-directory descriptor. Linux verifies
+through `/proc/self/fd/N`. DuckDB 1.5.5 on Darwin cannot open `/dev/fd/N`; it
+rewrites that path to `/dev/fd/<backup-basename>` and reports that the database
+does not exist, so Darwin retains a no-follow descriptor and checks its identity
+against the directory entry immediately before and after pathname verification.
+That is sufficient for the stated trusted-UID model, but is not presented as
+same-UID ABA protection.
+
 `kamal wide-events-backup` runs the administrative executable in the existing
 accessory container over Kamal's SSH path. The executable asks the already
 running service to perform the operation over `/run/wide-events/admin.sock`; it

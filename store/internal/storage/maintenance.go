@@ -83,6 +83,34 @@ func (database *Database) VerifyBackup(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	return database.verifyBackupContents(ctx, path)
+}
+
+// VerifyBackupFile verifies the held backup object. Linux can bind DuckDB to
+// the descriptor through /proc; Darwin falls back to the validated pathname
+// because DuckDB 1.5.5 rewrites /dev/fd/N to /dev/fd/<backup-basename> and
+// fails to open it. Callers retain the descriptor and check identity before
+// and after this call under the trusted-store-UID threat model.
+func (database *Database) VerifyBackupFile(ctx context.Context, path string, file *os.File) error {
+	path, err := validateExistingBackup(path)
+	if err != nil {
+		return err
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect backup path identity: %w", err)
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect backup descriptor identity: %w", err)
+	}
+	if !os.SameFile(pathInfo, fileInfo) {
+		return fmt.Errorf("backup descriptor does not identify the validated path")
+	}
+	return database.verifyBackupContents(ctx, backupDescriptorPath(path, file.Fd()))
+}
+
+func (database *Database) verifyBackupContents(ctx context.Context, path string) error {
 	connector, err := duckdb.NewConnector(path+"?access_mode=read_only", func(driver.ExecerContext) error { return nil })
 	if err != nil {
 		return fmt.Errorf("open backup connector: %w", err)

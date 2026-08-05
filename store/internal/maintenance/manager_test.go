@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -214,6 +215,35 @@ func TestRecoveryRacingBackupCannotClearMaintenanceReadiness(t *testing.T) {
 	database.mutex.Unlock()
 }
 
+func TestNoSpaceImmediatelyBeforeMaintenanceRemainsLatchedUntilLaterProbe(t *testing.T) {
+	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
+	preflightObserved := make(chan struct{})
+	releasePreflight := make(chan struct{})
+	var blockFirst sync.Once
+	database.updateCapacityHook = func() {
+		blockFirst.Do(func() {
+			close(preflightObserved)
+			<-releasePreflight
+		})
+	}
+	maintenanceResult := make(chan error, 1)
+	go func() { maintenanceResult <- manager.runRetention(context.Background()) }()
+	<-preflightObserved
+	manager.HandleNoSpace(context.Background(), syscall.ENOSPC)
+	close(releasePreflight)
+	require.NoError(t, <-maintenanceResult)
+	database.mutex.Lock()
+	assert.False(t, database.ready)
+	assert.Equal(t, "disk_space_low", database.reason)
+	database.mutex.Unlock()
+
+	require.NoError(t, manager.RecoverWrite(context.Background()))
+	database.mutex.Lock()
+	assert.True(t, database.ready)
+	assert.Empty(t, database.reason)
+	database.mutex.Unlock()
+}
+
 func TestRunDailyRunsRetentionAndAutomaticBackupAtMostOncePerUTCDay(t *testing.T) {
 	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
 	manager.now = func() time.Time { return time.Date(2026, 8, 5, 23, 30, 0, 0, time.FixedZone("west", -7*60*60)) }
@@ -259,6 +289,12 @@ func TestBackupPublishesFinalNameOnlyAfterCandidateVerification(t *testing.T) {
 	assert.NotContains(t, manager.LastBackupPath(), ".partial")
 }
 
+func TestManagerVerifiesCandidateThroughHeldFile(t *testing.T) {
+	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
+	require.NoError(t, manager.Backup(context.Background()))
+	assert.Equal(t, 1, database.fileVerifications)
+}
+
 func TestManagerPublishesARealVerifiedDuckDBBackup(t *testing.T) {
 	directory := t.TempDir()
 	databasePath := filepath.Join(directory, "wide-events.duckdb")
@@ -288,6 +324,15 @@ func TestFailedBackupVerificationRemovesPartialCopy(t *testing.T) {
 		return nil
 	}
 	assert.ErrorContains(t, manager.Backup(context.Background()), "verification failed")
+	entries, err := os.ReadDir(manager.backupDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestPartialCreateFailureRemovesReservedCandidate(t *testing.T) {
+	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
+	database.createHook = func(string) error { return errors.New("copy failed after partial creation") }
+	assert.ErrorContains(t, manager.Backup(context.Background()), "copy failed after partial creation")
 	entries, err := os.ReadDir(manager.backupDir)
 	require.NoError(t, err)
 	assert.Empty(t, entries)
@@ -325,6 +370,23 @@ func TestExclusivePublishDoesNotOverwriteConcurrentFinal(t *testing.T) {
 	assert.Equal(t, "candidate", string(content))
 }
 
+func TestExclusiveRenameUsesHeldDirectoryDescriptorAfterPathMoves(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "original")
+	moved := filepath.Join(parent, "moved")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(directory, ".candidate.partial"), []byte("candidate"), 0o600))
+	directoryFile, err := os.Open(directory)
+	require.NoError(t, err)
+	defer directoryFile.Close()
+	require.NoError(t, os.Rename(directory, moved))
+
+	require.NoError(t, renameNoReplace(int(directoryFile.Fd()), directory, ".candidate.partial", "wide-events-final.duckdb"))
+	content, err := os.ReadFile(filepath.Join(moved, "wide-events-final.duckdb"))
+	require.NoError(t, err)
+	assert.Equal(t, "candidate", string(content))
+}
+
 func TestBackupFailsWithoutOverwritingAConcurrentFinal(t *testing.T) {
 	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
 	final := filepath.Join(manager.backupDir, "wide-events-20260805T120000.000000000Z.duckdb")
@@ -346,8 +408,33 @@ func TestBackupFailsWithoutOverwritingAConcurrentFinal(t *testing.T) {
 	}
 }
 
+func TestPostPublicationCleanupRetainsFinalNameAndSurfacesFailure(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(directory, 0o700))
+	candidatePath := filepath.Join(directory, ".candidate.partial")
+	require.NoError(t, os.WriteFile(candidatePath, []byte("candidate"), 0o600))
+	object, err := openCandidateObject(directory, candidatePath)
+	require.NoError(t, err)
+	defer object.Close()
+	finalName := "wide-events-final.duckdb"
+	require.NoError(t, renameNoReplace(int(object.directory.Fd()), directory, object.name, finalName))
+	object.name = finalName
+	require.NoError(t, os.Chmod(directory, 0o755))
+
+	err = object.validatePublished()
+	assert.ErrorContains(t, err, "cleanup invalid published backup")
+	assert.Equal(t, finalName, object.name)
+	assert.FileExists(t, filepath.Join(directory, finalName))
+
+	require.NoError(t, os.Chmod(directory, 0o700))
+	require.NoError(t, object.cleanupReserved())
+	assert.NoFileExists(t, filepath.Join(directory, finalName))
+}
+
 func TestOwnedRemovalPreservesAReplacementAtTheSameName(t *testing.T) {
-	directory := t.TempDir()
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	require.NoError(t, os.Chmod(directory, 0o700))
 	path := filepath.Join(directory, "wide-events-old.duckdb")
 	require.NoError(t, os.WriteFile(path, []byte("verified"), 0o600))
@@ -431,6 +518,27 @@ func TestPruneDoesNotCountOrDeleteAPathReplacedDuringVerification(t *testing.T) 
 	assert.Equal(t, 3, verified)
 }
 
+func TestPruneVerifiesHeldFileAgainAfterExclusiveQuarantine(t *testing.T) {
+	manager, database := newTestManager(t, &fakeProbe{spaces: []disk.Space{{Free: 10 << 30, Total: 20 << 30}}}, 64<<20)
+	require.NoError(t, manager.prepareBackupDirectory())
+	for index := 1; index <= 4; index++ {
+		path := filepath.Join(manager.backupDir, fmt.Sprintf("wide-events-2020010%dT000000.000000000Z.duckdb", index))
+		require.NoError(t, os.WriteFile(path, []byte("verified"), 0o600))
+		require.NoError(t, os.Chtimes(path, time.Unix(int64(index), 0), time.Unix(int64(index), 0)))
+	}
+	var quarantinedVerifications atomic.Int32
+	database.verifyHook = func(path string) error {
+		if strings.HasPrefix(filepath.Base(path), ".wide-events-quarantine-") {
+			quarantinedVerifications.Add(1)
+		}
+		return nil
+	}
+
+	require.NoError(t, manager.Backup(context.Background()))
+	assert.Positive(t, quarantinedVerifications.Load())
+	assert.Len(t, finalBackupNames(t, manager.backupDir), 3)
+}
+
 func TestBackupRejectsSymlinkAncestorAndUnsafeDirectoryMode(t *testing.T) {
 	for name, setup := range map[string]func(*testing.T, *Manager){
 		"symlink ancestor": func(t *testing.T, manager *Manager) {
@@ -486,6 +594,22 @@ func TestBackupAllowsRootOwnedStickyTemporaryAncestor(t *testing.T) {
 
 	require.NoError(t, manager.Backup(context.Background()))
 	assert.FileExists(t, manager.LastBackupPath())
+}
+
+func TestTrustedDirectoryTraversalRejectsSymlinkComponent(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o700))
+	realDirectory := filepath.Join(parent, "real")
+	require.NoError(t, os.Mkdir(realDirectory, 0o700))
+	link := filepath.Join(parent, "linked")
+	require.NoError(t, os.Symlink(realDirectory, link))
+
+	directory, err := openTrustedDirectoryPath(link)
+	assert.Error(t, err)
+	if directory != nil {
+		_ = directory.Close()
+	}
 }
 
 func TestBackupRejectsCandidateReplacement(t *testing.T) {
@@ -638,6 +762,7 @@ type fakeDatabase struct {
 	retentions           int
 	backups              int
 	verifications        int
+	fileVerifications    int
 	created              []string
 	verifyErr            error
 	createHook           func(string) error
@@ -649,13 +774,18 @@ type fakeDatabase struct {
 	lastRetentionResult  error
 	setReadyErr          error
 	setReadyHook         func(bool, string)
+	updateCapacityHook   func()
 }
 
 func (database *fakeDatabase) UpdateCapacity(_ context.Context, databaseBytes, freeBytes int64) error {
 	database.mutex.Lock()
-	defer database.mutex.Unlock()
 	database.databaseBytes = databaseBytes
 	database.freeBytes = freeBytes
+	hook := database.updateCapacityHook
+	database.mutex.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
@@ -712,6 +842,14 @@ func (database *fakeDatabase) VerifyBackup(_ context.Context, path string) error
 		}
 	}
 	return database.verifyErr
+}
+
+func (database *fakeDatabase) VerifyBackupFile(ctx context.Context, path string, file *os.File) error {
+	if _, err := file.Stat(); err != nil {
+		return err
+	}
+	database.fileVerifications++
+	return database.VerifyBackup(ctx, path)
 }
 
 func finalBackupNames(t *testing.T, directory string) []string {

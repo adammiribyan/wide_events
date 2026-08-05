@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +51,7 @@ type database interface {
 	RecordBackup(context.Context, time.Time, error) error
 	CreateBackup(context.Context, string) error
 	VerifyBackup(context.Context, string) error
+	VerifyBackupFile(context.Context, string, *os.File) error
 }
 
 type admissionHookSetter interface {
@@ -83,13 +85,14 @@ type Manager struct {
 	backupDir string
 	gate      *gate
 
-	operation chan struct{}
-	recovery  chan struct{}
-	stop      chan struct{}
-	done      chan struct{}
-	startOnce sync.Once
-	closeOnce sync.Once
-	readiness sync.Mutex
+	operation         chan struct{}
+	recovery          chan struct{}
+	stop              chan struct{}
+	done              chan struct{}
+	startOnce         sync.Once
+	closeOnce         sync.Once
+	readiness         sync.Mutex
+	noSpaceGeneration atomic.Uint64
 
 	mutex           sync.Mutex
 	lastDaily       string
@@ -100,7 +103,7 @@ type Manager struct {
 	started         bool
 	closed          bool
 	maintenanceOpen bool
-	pendingDiskLow  bool
+	diskLowLatched  bool
 }
 
 // NewManager constructs a manager and installs admission callbacks on the
@@ -196,10 +199,11 @@ func (manager *Manager) AdmitQuery(ctx context.Context) (func(), error) {
 // HandleNoSpace publishes an actual database I/O exhaustion as the same typed
 // disk degradation used by the preflight.
 func (manager *Manager) HandleNoSpace(ctx context.Context, _ error) {
+	manager.noSpaceGeneration.Add(1)
 	manager.readiness.Lock()
 	defer manager.readiness.Unlock()
+	manager.diskLowLatched = true
 	if manager.maintenanceOpen {
-		manager.pendingDiskLow = true
 		return
 	}
 	_ = manager.database.SetWriteReady(ctx, false, "disk_space_low")
@@ -293,12 +297,12 @@ func (manager *Manager) runRetention(parent context.Context) (result error) {
 		return err
 	}
 	if assessment.genericLow() {
-		if err := manager.setWriteState(ctx, false, "disk_space_low"); err != nil {
+		if err := manager.setAssessmentState(ctx, assessment); err != nil {
 			return err
 		}
 		return &DiskSpaceError{RequiredBytes: assessment.floor, AvailableBytes: assessment.space.Free}
 	}
-	if err := manager.beginMaintenance(ctx, false); err != nil {
+	if err := manager.beginMaintenance(ctx, false, assessment); err != nil {
 		return err
 	}
 	defer func() {
@@ -335,16 +339,12 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 		return err
 	}
 	if err := assessment.backupError(); err != nil {
-		ready, reason := true, ""
-		if assessment.genericLow() {
-			ready, reason = false, "disk_space_low"
-		}
-		if readinessErr := manager.setWriteState(ctx, ready, reason); readinessErr != nil {
+		if readinessErr := manager.setAssessmentState(ctx, assessment); readinessErr != nil {
 			return errors.Join(err, readinessErr)
 		}
 		return err
 	}
-	if err := manager.beginMaintenance(ctx, true); err != nil {
+	if err := manager.beginMaintenance(ctx, true, assessment); err != nil {
 		return err
 	}
 	diskLow := false
@@ -359,6 +359,7 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 	if err != nil {
 		return err
 	}
+	manager.observeAssessment(assessment)
 	if err := assessment.backupError(); err != nil {
 		diskLow = assessment.genericLow()
 		return err
@@ -374,21 +375,28 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 	if err != nil {
 		return err
 	}
-	if err := manager.database.CreateBackup(ctx, candidatePath); err != nil {
-		return err
-	}
-	candidate, err := openCandidateObject(manager.backupDir, candidatePath)
+	candidate, err := reserveCandidateObject(manager.backupDir, candidatePath)
 	if err != nil {
 		return err
 	}
-	defer candidate.Close()
-	published := false
+	cleanupCandidate := true
 	defer func() {
-		if !published {
-			_ = candidate.removeOwned()
+		if cleanupCandidate {
+			if cleanupErr := candidate.cleanupReserved(); cleanupErr != nil {
+				result = errors.Join(result, fmt.Errorf("cleanup backup candidate: %w", cleanupErr))
+			}
+		}
+		if closeErr := candidate.Close(); closeErr != nil {
+			result = errors.Join(result, fmt.Errorf("close backup candidate: %w", closeErr))
 		}
 	}()
-	if err := manager.database.VerifyBackup(ctx, candidatePath); err != nil {
+	if err := manager.database.CreateBackup(ctx, candidatePath); err != nil {
+		return err
+	}
+	if err := candidate.openFile(true); err != nil {
+		return err
+	}
+	if err := manager.database.VerifyBackupFile(ctx, candidatePath, candidate.file); err != nil {
 		return err
 	}
 	if err := candidate.revalidate("after verification"); err != nil {
@@ -397,7 +405,7 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 	if err := candidate.publish(filepath.Base(finalPath)); err != nil {
 		return err
 	}
-	published = true
+	cleanupCandidate = false
 	if err := syncDirectory(manager.backupDir); err != nil {
 		return err
 	}
@@ -411,9 +419,11 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 }
 
 type capacityAssessment struct {
-	space          disk.Space
-	floor          int64
-	backupRequired int64
+	space            disk.Space
+	floor            int64
+	backupRequired   int64
+	generationBefore uint64
+	generationAfter  uint64
 }
 
 func (assessment capacityAssessment) genericLow() bool {
@@ -432,10 +442,12 @@ func (manager *Manager) assessCapacity(ctx context.Context) (capacityAssessment,
 	if err != nil {
 		return capacityAssessment{}, fmt.Errorf("stat database file: %w", err)
 	}
+	generationBefore := manager.noSpaceGeneration.Load()
 	space, err := manager.probe.Space(manager.config.Database)
 	if err != nil {
 		return capacityAssessment{}, err
 	}
+	generationAfter := manager.noSpaceGeneration.Load()
 	if err := manager.database.UpdateCapacity(ctx, info.Size(), space.Free); err != nil {
 		return capacityAssessment{}, err
 	}
@@ -451,11 +463,13 @@ func (manager *Manager) assessCapacity(ctx context.Context) (capacityAssessment,
 	manager.setBackupSpace(required, space.Free)
 	return capacityAssessment{
 		space: space, floor: floor, backupRequired: required,
+		generationBefore: generationBefore, generationAfter: generationAfter,
 	}, nil
 }
 
 func (manager *Manager) applyWriteCapacity(ctx context.Context, assessment capacityAssessment) error {
-	if assessment.genericLow() {
+	manager.observeAssessmentLocked(assessment)
+	if manager.diskLowLatched {
 		if err := manager.database.SetWriteReady(ctx, false, "disk_space_low"); err != nil {
 			return err
 		}
@@ -467,8 +481,9 @@ func (manager *Manager) applyWriteCapacity(ctx context.Context, assessment capac
 // Lock order for readiness transitions is always readiness -> gate. Closing
 // is marked while both are held, but draining happens after readiness is
 // released so admitted writer callbacks can finish without inversion.
-func (manager *Manager) beginMaintenance(ctx context.Context, queries bool) error {
+func (manager *Manager) beginMaintenance(ctx context.Context, queries bool, assessment capacityAssessment) error {
 	manager.readiness.Lock()
+	manager.observeAssessmentLocked(assessment)
 	manager.gate.startClose(queries)
 	if err := manager.database.SetWriteReady(ctx, false, "maintenance"); err != nil {
 		manager.gate.open()
@@ -486,22 +501,46 @@ func (manager *Manager) beginMaintenance(ctx context.Context, queries bool) erro
 func (manager *Manager) finishMaintenance(diskLow bool) error {
 	manager.readiness.Lock()
 	defer manager.readiness.Unlock()
-	diskLow = diskLow || manager.pendingDiskLow
+	if diskLow {
+		manager.diskLowLatched = true
+	}
+	diskLow = manager.diskLowLatched
 	ready, reason := true, ""
 	if diskLow {
 		ready, reason = false, "disk_space_low"
 	}
 	err := manager.setWriteReady(ready, reason)
 	manager.maintenanceOpen = false
-	manager.pendingDiskLow = false
 	manager.gate.open()
 	return err
 }
 
-func (manager *Manager) setWriteState(ctx context.Context, ready bool, reason string) error {
+func (manager *Manager) setAssessmentState(ctx context.Context, assessment capacityAssessment) error {
 	manager.readiness.Lock()
 	defer manager.readiness.Unlock()
+	manager.observeAssessmentLocked(assessment)
+	ready, reason := true, ""
+	if manager.diskLowLatched {
+		ready, reason = false, "disk_space_low"
+	}
 	return manager.database.SetWriteReady(ctx, ready, reason)
+}
+
+func (manager *Manager) observeAssessment(assessment capacityAssessment) {
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
+	manager.observeAssessmentLocked(assessment)
+}
+
+func (manager *Manager) observeAssessmentLocked(assessment capacityAssessment) {
+	if assessment.genericLow() {
+		manager.diskLowLatched = true
+		return
+	}
+	if assessment.generationBefore == assessment.generationAfter &&
+		manager.noSpaceGeneration.Load() == assessment.generationAfter {
+		manager.diskLowLatched = false
+	}
 }
 
 func (manager *Manager) prepareBackupDirectory() error {
@@ -522,11 +561,8 @@ func (manager *Manager) prepareBackupDirectory() error {
 	}
 	directory = filepath.Join(resolvedParent, filepath.Base(directory))
 	manager.backupDir = directory
-	if err := validateTrustedAncestors(resolvedParent); err != nil {
+	if err := ensureOwnedBackupDirectory(resolvedParent, filepath.Base(directory)); err != nil {
 		return err
-	}
-	if err := os.Mkdir(directory, 0o700); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("create backup directory: %w", err)
 	}
 	return manager.validateBackupDirectory()
 }
@@ -545,49 +581,6 @@ func (manager *Manager) validateBackupDirectory() error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int(stat.Uid) != os.Geteuid() {
 		return fmt.Errorf("backup directory must be owned by uid %d", os.Geteuid())
-	}
-	return nil
-}
-
-func validateTrustedAncestors(path string) error {
-	volume := filepath.VolumeName(path)
-	remainder := strings.TrimPrefix(path, volume)
-	current := volume + string(os.PathSeparator)
-	for _, component := range strings.Split(strings.TrimPrefix(remainder, string(os.PathSeparator)), string(os.PathSeparator)) {
-		if component == "" {
-			continue
-		}
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return fmt.Errorf("inspect backup ancestor %q: %w", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("backup ancestor %q must not be a symlink", current)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("backup ancestor %q must be a directory", current)
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("inspect backup ancestor %q ownership", current)
-		}
-		owner := int(stat.Uid)
-		permissions := info.Mode().Perm()
-		writableByOthers := permissions&0o022 != 0
-		switch {
-		case owner == os.Geteuid():
-			if writableByOthers {
-				return fmt.Errorf("backup ancestor %q is a writable ancestor (group or other)", current)
-			}
-		case owner == 0:
-			rootStickyTemporary := info.Mode()&os.ModeSticky != 0 && permissions == 0o777
-			if writableByOthers && !rootStickyTemporary {
-				return fmt.Errorf("backup ancestor %q is a writable ancestor without the root-owned sticky exception", current)
-			}
-		default:
-			return fmt.Errorf("backup ancestor %q is owned by untrusted uid %d", current, owner)
-		}
 	}
 	return nil
 }
@@ -658,7 +651,7 @@ func (manager *Manager) pruneBackups(ctx context.Context, current string) error 
 		}
 		if path != current {
 			verifyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-			verifyErr := manager.database.VerifyBackup(verifyContext, path)
+			verifyErr := manager.database.VerifyBackupFile(verifyContext, path, object.file)
 			cancel()
 			if verifyErr != nil {
 				_ = object.Close()
@@ -690,13 +683,40 @@ func (manager *Manager) pruneBackups(ctx context.Context, current string) error 
 	for len(backups) > 3 {
 		oldest := backups[0]
 		backups = backups[1:]
-		removeErr := oldest.object.removeOwned()
-		closeErr := oldest.object.Close()
-		if errors.Is(removeErr, errBackupObjectChanged) {
+		originalName, quarantineErr := oldest.object.quarantine()
+		if errors.Is(quarantineErr, errBackupObjectChanged) && !errors.Is(quarantineErr, errBackupRollbackFailed) {
+			_ = oldest.object.Close()
 			continue
-		} else if removeErr != nil {
-			return fmt.Errorf("remove expired backup: %w", removeErr)
-		} else if closeErr != nil {
+		} else if quarantineErr != nil {
+			_ = oldest.object.Close()
+			return fmt.Errorf("quarantine expired backup: %w", quarantineErr)
+		}
+		quarantinePath := filepath.Join(manager.backupDir, oldest.object.name)
+		verifyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+		verifyErr := manager.database.VerifyBackupFile(verifyContext, quarantinePath, oldest.object.file)
+		cancel()
+		if verifyErr != nil {
+			rollbackErr := oldest.object.rollbackQuarantine(originalName)
+			_ = oldest.object.Close()
+			if rollbackErr != nil {
+				return errors.Join(fmt.Errorf("verify quarantined backup: %w", verifyErr), rollbackErr)
+			}
+			continue
+		}
+		if identityErr := oldest.object.revalidate("after quarantine verification"); identityErr != nil {
+			rollbackErr := oldest.object.rollbackQuarantine(originalName)
+			_ = oldest.object.Close()
+			if rollbackErr != nil {
+				return errors.Join(identityErr, rollbackErr)
+			}
+			continue
+		}
+		unlinkErr := oldest.object.unlinkQuarantined()
+		closeErr := oldest.object.Close()
+		if unlinkErr != nil {
+			return fmt.Errorf("remove expired backup: %w", unlinkErr)
+		}
+		if closeErr != nil {
 			return fmt.Errorf("close expired backup: %w", closeErr)
 		}
 	}

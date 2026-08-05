@@ -2,12 +2,8 @@
 
 package maintenance
 
-import (
-	"path/filepath"
+import "golang.org/x/sys/unix"
 
-	"golang.org/x/sys/unix"
-)
-
-func renameNoReplace(_ int, directory, oldName, newName string) error {
-	return unix.RenamexNp(filepath.Join(directory, oldName), filepath.Join(directory, newName), unix.RENAME_EXCL)
+func renameNoReplace(directoryFD int, _ string, oldName, newName string) error {
+	return unix.RenameatxNp(directoryFD, oldName, directoryFD, newName, unix.RENAME_EXCL)
 }
