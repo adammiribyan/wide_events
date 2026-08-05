@@ -19,6 +19,12 @@ module WideEvent
       WideEvent.config.registry_path ||= path if app.root.join(path).exist?
     end
 
+    # Best-effort drain of the store sender's queue before the process
+    # exits. A no-op unless the store sink was actually resolved.
+    initializer "wide_event.shutdown" do
+      at_exit { WideEvent.shutdown! }
+    end
+
     # After the app's own initializers, so the host's OpenTelemetry::SDK
     # configuration (and any WideEvent.configure block) has already run.
     config.after_initialize do

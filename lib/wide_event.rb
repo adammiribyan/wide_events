@@ -4,12 +4,15 @@ require "active_support/isolated_execution_state"
 require "active_support/core_ext/object/blank"
 
 require "wide_event/version"
+require "wide_event/store/envelope"
+require "wide_event/store/client"
+require "wide_event/store/sender"
 require "wide_event/configuration"
 require "wide_event/registry"
-require "wide_event/store/envelope"
 require "wide_event/sinks/otel_span"
 require "wide_event/sinks/log_line"
 require "wide_event/sinks/memory"
+require "wide_event/sinks/store"
 require "wide_event/middleware"
 require "wide_event/span_counter_processor"
 require "wide_event/subscribers"
@@ -34,7 +37,22 @@ module WideEvent
     end
 
     def reset_configuration!
+      @config&.shutdown_store_sender!
       @config = Configuration.new
+    end
+
+    # Best-effort flush of any in-flight store delivery: gives the sender's
+    # worker thread up to `timeout` seconds to drain its queue before the
+    # process exits. A no-op when no sink has been resolved yet (nothing to
+    # flush) or when the resolved sink has no shutdown hook. Never raises.
+    def shutdown!(timeout: 2.0)
+      return nil unless config.resolved?
+      sink = config.resolved_sink
+      sink.shutdown(timeout: timeout) if sink.respond_to?(:shutdown)
+      nil
+    rescue StandardError => e
+      handle_error(e, "shutdown")
+      nil
     end
 
     def enabled?

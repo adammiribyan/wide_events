@@ -84,4 +84,82 @@ class ConfigurationTest < ActiveSupport::TestCase
     job = Struct.new(:provider_job_id).new(nil)
     assert_equal false, config.scheduled_job_detector.call(job)
   end
+
+  test "store_* defaults come from the WIDE_EVENTS_* environment variables" do
+    with_env(
+      "WIDE_EVENTS_URL" => "https://store.example.com",
+      "WIDE_EVENTS_SERVICE" => "checkout",
+      "WIDE_EVENTS_ENVIRONMENT" => "production",
+      "WIDE_EVENTS_INGEST_TOKEN" => "ingest-token",
+      "WIDE_EVENTS_QUERY_TOKEN" => "query-token"
+    ) do
+      config = WideEvent::Configuration.new
+      assert_equal "https://store.example.com", config.store_url
+      assert_equal "checkout", config.store_service
+      assert_equal "production", config.store_environment
+      assert_equal "ingest-token", config.store_ingest_token
+      assert_equal "query-token", config.store_query_token
+      assert_equal true, config.enabled
+      assert_equal :store, config.sink
+    end
+  end
+
+  test "without WIDE_EVENTS_URL the store sink is not selected and store fields are nil" do
+    with_env("WIDE_EVENTS_URL" => nil, "WIDE_EVENTS_SERVICE" => nil, "WIDE_EVENTS_INGEST_TOKEN" => nil) do
+      config = WideEvent::Configuration.new
+      assert_nil config.store_url
+      assert_nil config.store_service
+      assert_nil config.store_ingest_token
+      assert_equal :otel, config.sink
+    end
+  end
+
+  test "sink :store resolves to a store sink and constructs its own sender" do
+    config = WideEvent::Configuration.new
+    config.store_url = "https://store.example.com"
+    config.store_service = "checkout"
+    config.store_environment = "test"
+    config.store_ingest_token = "token"
+    config.sink = :store
+
+    assert_kind_of WideEvent::Sinks::Store, config.resolved_sink
+  ensure
+    config.shutdown_store_sender!
+  end
+
+  test "sink :store without a service falls back to a no-op sink and reports through handle_error" do
+    config = WideEvent::Configuration.new
+    config.store_url = "https://store.example.com"
+    config.store_ingest_token = "token"
+    config.store_environment = "test"
+    config.sink = :store
+
+    errors = []
+    config.error_handler = ->(e, msg) { errors << [ e.class, msg ] }
+
+    assert_nothing_raised { config.resolved_sink.flush({ "duration_ms" => 1.0 }) }
+    assert_equal [ [ ArgumentError, "store_sink_configuration" ] ], errors
+  end
+
+  test "resolved? is false until resolved_sink has actually been called" do
+    config = WideEvent::Configuration.new
+    refute config.resolved?
+    config.resolved_sink
+    assert config.resolved?
+  end
+
+  test "shutdown_store_sender! is a no-op when no store sink was ever built" do
+    config = WideEvent::Configuration.new
+    assert_nothing_raised { config.shutdown_store_sender! }
+  end
+
+  private
+
+  def with_env(vars)
+    originals = vars.keys.to_h { |k| [ k, ENV[k] ] }
+    vars.each { |k, v| ENV[k] = v }
+    yield
+  ensure
+    originals.each { |k, v| ENV[k] = v }
+  end
 end

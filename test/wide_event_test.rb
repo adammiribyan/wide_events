@@ -139,4 +139,50 @@ class WideEventTest < ActiveSupport::TestCase
       assert_nothing_raised { WideEvent.set("a" => 1) }
     end
   end
+
+  test "shutdown! is a no-op when no sink has been resolved yet" do
+    refute WideEvent.config.resolved?
+    assert_nothing_raised { WideEvent.shutdown! }
+    refute WideEvent.config.resolved?
+  end
+
+  test "shutdown! delegates to the resolved sink's shutdown hook" do
+    calls = []
+    sink = Object.new
+    sink.define_singleton_method(:flush) { |_attrs| nil }
+    sink.define_singleton_method(:shutdown) { |timeout:| calls << timeout }
+    WideEvent.configure { |c| c.sink = sink }
+    WideEvent.config.resolved_sink # force resolution
+    WideEvent.shutdown!(timeout: 3.0)
+    assert_equal [ 3.0 ], calls
+  end
+
+  test "shutdown! never raises when the resolved sink has no shutdown hook or raises" do
+    WideEvent.configure { |c| c.sink = WideEvent::Sinks::Memory.new }
+    WideEvent.config.resolved_sink
+    assert_nothing_raised { WideEvent.shutdown! }
+
+    raising_sink = Object.new
+    raising_sink.define_singleton_method(:flush) { |_attrs| nil }
+    raising_sink.define_singleton_method(:shutdown) { |timeout:| raise "boom" }
+    WideEvent.configure { |c| c.sink = raising_sink }
+    WideEvent.config.resolved_sink
+    assert_nothing_raised { WideEvent.shutdown! }
+  end
+
+  test "reset_configuration! shuts down an existing store sender" do
+    WideEvent.configure do |c|
+      c.store_url = "https://store.example.com"
+      c.store_service = "checkout"
+      c.store_environment = "test"
+      c.store_ingest_token = "token"
+      c.sink = :store
+    end
+    sink = WideEvent.config.resolved_sink
+    assert_kind_of WideEvent::Sinks::Store, sink
+
+    WideEvent.reset_configuration!
+
+    assert_equal :otel, WideEvent.config.sink
+  end
 end
