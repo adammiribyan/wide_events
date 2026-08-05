@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -393,7 +394,9 @@ func classifyCommitError(err error) error {
 		return nil
 	}
 	var databaseError *duckdb.Error
-	if errors.Is(err, syscall.ENOSPC) || errors.As(err, &databaseError) && databaseError.Type == duckdb.ErrorTypeIO {
+	duckNoSpace := errors.As(err, &databaseError) && databaseError.Type == duckdb.ErrorTypeIO &&
+		strings.Contains(strings.ToLower(databaseError.Msg), "no space left on device")
+	if errors.Is(err, syscall.ENOSPC) || duckNoSpace {
 		return fmt.Errorf("%w: %w", ErrInsufficientStorage, err)
 	}
 	return err

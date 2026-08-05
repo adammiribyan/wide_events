@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
+	"github.com/adammiribyan/wide_events/store/internal/disk"
 	"github.com/adammiribyan/wide_events/store/internal/ingest"
+	"github.com/adammiribyan/wide_events/store/internal/maintenance"
 	"github.com/adammiribyan/wide_events/store/internal/protocol"
 	"github.com/adammiribyan/wide_events/store/internal/storage"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +30,40 @@ func TestDiskDegradedHealthRemainsRoutable(t *testing.T) {
 
 	ingestion := postEvents(t, server.handler, "Bearer "+testIngestToken, validBatchJSON(t, "checkout", "test"), "")
 	assert.Equal(t, http.StatusInsufficientStorage, ingestion.Code)
+}
+
+func TestDiskDegradedIngestPerformsOneGuardedRecoveryProbe(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "wide-events.duckdb")
+	database, err := storage.Open(context.Background(), config.Config{
+		Database: databasePath, Service: "checkout", Environment: "test", QueryTempBytes: 64 << 20,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	require.NoError(t, database.SetWriteReady(context.Background(), false, "disk_space_low"))
+	probe := &recoveringProbe{}
+	manager := maintenance.NewManager(maintenance.Dependencies{
+		Config: config.Config{Database: databasePath, RetentionDays: 30}, Database: database, Probe: probe,
+	})
+	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	handler := New(testConfig(), Dependencies{
+		Database: database,
+		Writer: submitterFunc(func(context.Context, protocol.Batch, []byte) (storage.CommitResult, error) {
+			return storage.CommitResult{}, nil
+		}),
+		Recovery: manager,
+	})
+
+	response := postEvents(t, handler, "Bearer "+testIngestToken, validBatchJSON(t, "checkout", "test"), "")
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, 1, probe.calls)
+}
+
+type recoveringProbe struct{ calls int }
+
+func (probe *recoveringProbe) Space(string) (disk.Space, error) {
+	probe.calls++
+	return disk.Space{Free: 3 << 30, Total: 10 << 30}, nil
 }
 
 func TestHealthOmitsStoreAndDatabaseVersions(t *testing.T) {

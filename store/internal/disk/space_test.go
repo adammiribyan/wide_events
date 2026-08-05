@@ -22,3 +22,9 @@ func TestStatFSProbeAcceptsAPathThatDoesNotExistYet(t *testing.T) {
 	assert.Positive(t, space.Free)
 	assert.LessOrEqual(t, space.Free, space.Total)
 }
+
+func TestStatFSByteMultiplicationSaturatesBeforeUnsignedConversion(t *testing.T) {
+	maximum := ^uint64(0)
+	assert.Equal(t, int64(^uint64(0)>>1), saturatingProduct(maximum, 4096))
+	assert.Zero(t, saturatingProduct(0, 4096))
+}

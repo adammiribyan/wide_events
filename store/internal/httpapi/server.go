@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	"github.com/adammiribyan/wide_events/store/internal/ingest"
@@ -31,11 +32,16 @@ type queryExecutor interface {
 	Execute(context.Context, query.Request, io.Writer) (query.ResultMeta, error)
 }
 
+type writeRecovery interface {
+	RecoverWrite(context.Context) error
+}
+
 // Dependencies are the owned process resources used by the HTTP routes.
 type Dependencies struct {
 	Database *storage.Database
 	Writer   submitter
 	Query    queryExecutor
+	Recovery writeRecovery
 	Logger   *slog.Logger
 }
 
@@ -44,6 +50,7 @@ type server struct {
 	database *storage.Database
 	writer   submitter
 	queries  queryExecutor
+	recovery writeRecovery
 	decoders chan struct{}
 }
 
@@ -71,6 +78,7 @@ func New(cfg config.Config, dependencies Dependencies) http.Handler {
 		database: dependencies.Database,
 		writer:   dependencies.Writer,
 		queries:  queries,
+		recovery: dependencies.Recovery,
 		decoders: make(chan struct{}, maxConcurrentDecodes),
 	}
 	mux := http.NewServeMux()
@@ -90,6 +98,18 @@ func (server *server) ingest(response http.ResponseWriter, request *http.Request
 	if err != nil {
 		writeError(response, http.StatusServiceUnavailable)
 		return
+	}
+	if !writeReady {
+		if degradationReason == "disk_space_low" && server.recovery != nil {
+			recoveryContext, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+			_ = server.recovery.RecoverWrite(recoveryContext)
+			cancel()
+			writeReady, degradationReason, err = server.database.WriteStatus(request.Context())
+			if err != nil {
+				writeError(response, http.StatusServiceUnavailable)
+				return
+			}
+		}
 	}
 	if !writeReady {
 		code := http.StatusServiceUnavailable

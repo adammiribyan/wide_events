@@ -41,20 +41,23 @@ func (StatFSProbe) Space(path string) (Space, error) {
 	if err := syscall.Statfs(resolved, &stats); err != nil {
 		return Space{}, fmt.Errorf("probe filesystem capacity: %w", err)
 	}
-	blockSize := int64(stats.Bsize)
+	if stats.Bsize <= 0 {
+		return Space{}, fmt.Errorf("probe filesystem capacity: invalid block size %d", stats.Bsize)
+	}
+	blockSize := uint64(stats.Bsize)
 	return validate(Space{
-		Total: saturatingProduct(int64(stats.Blocks), blockSize),
-		Free:  saturatingProduct(int64(stats.Bavail), blockSize),
+		Total: saturatingProduct(uint64(stats.Blocks), blockSize),
+		Free:  saturatingProduct(uint64(stats.Bavail), blockSize),
 	})
 }
 
-func saturatingProduct(left, right int64) int64 {
-	if left <= 0 || right <= 0 {
+func saturatingProduct(left, right uint64) int64 {
+	if left == 0 || right == 0 {
 		return 0
 	}
-	const maxInt64 = int64(^uint64(0) >> 1)
+	const maxInt64 = uint64(^uint64(0) >> 1)
 	if left > maxInt64/right {
-		return maxInt64
+		return int64(maxInt64)
 	}
-	return left * right
+	return int64(left * right)
 }

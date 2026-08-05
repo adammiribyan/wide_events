@@ -1,8 +1,9 @@
 package admin
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,7 +29,7 @@ func RunClient(socket string, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	var result response
-	if err := json.NewDecoder(bufio.NewReader(io.LimitReader(connection, maximumCommandBytes+1))).Decode(&result); err != nil {
+	if err := decodeResponse(connection, &result); err != nil {
 		_, _ = fmt.Fprintf(stderr, "read admin response: %v\n", err)
 		return 1
 	}
@@ -42,4 +43,27 @@ func RunClient(socket string, args []string, stdout, stderr io.Writer) int {
 	}
 	_, _ = fmt.Fprintln(stdout, result.Path)
 	return 0
+}
+
+func decodeResponse(reader io.Reader, result *response) error {
+	payload, err := io.ReadAll(io.LimitReader(reader, maximumCommandBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(payload) > maximumCommandBytes {
+		return fmt.Errorf("admin response exceeds %d bytes", maximumCommandBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(result); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("admin response contains a trailing value")
+		}
+		return err
+	}
+	return nil
 }

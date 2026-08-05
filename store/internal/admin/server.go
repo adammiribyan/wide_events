@@ -3,6 +3,7 @@ package admin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	maximumCommandBytes = 4096
-	connectionDeadline  = 30 * time.Second
+	maximumCommandBytes    = 4096
+	backupOperationTimeout = 5 * time.Minute
+	connectionDeadline     = backupOperationTimeout + 5*time.Second
 )
 
 // AdminManager is the only operation exposed on the local V1 protocol.
@@ -138,24 +140,41 @@ func handle(connection net.Conn, manager AdminManager) {
 		return
 	}
 	var request command
-	if err := json.Unmarshal(line, &request); err != nil || request.Command != "backup" {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || request.Command != "backup" {
 		_ = json.NewEncoder(connection).Encode(response{Error: "unsupported command"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		_ = json.NewEncoder(connection).Encode(response{Error: "unsupported command"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), backupOperationTimeout)
 	defer cancel()
-	if err := manager.Backup(ctx); err != nil {
+	clientGone := make(chan struct{})
+	go func() {
+		var buffer [1]byte
+		_, _ = connection.Read(buffer[:])
+		cancel()
+		close(clientGone)
+	}()
+	err = manager.Backup(ctx)
+	if err != nil {
 		result := response{Error: err.Error()}
 		var capacity backupCapacityError
 		if errors.As(err, &capacity) {
 			result.RequiredBytes, result.AvailableBytes = capacity.BackupCapacity()
 		}
 		_ = json.NewEncoder(connection).Encode(result)
-		return
+	} else {
+		result := response{OK: true}
+		if reporter, ok := manager.(backupPathReporter); ok {
+			result.Path = reporter.LastBackupPath()
+		}
+		_ = json.NewEncoder(connection).Encode(result)
 	}
-	result := response{OK: true}
-	if reporter, ok := manager.(backupPathReporter); ok {
-		result.Path = reporter.LastBackupPath()
-	}
-	_ = json.NewEncoder(connection).Encode(result)
+	_ = connection.Close()
+	<-clientGone
 }

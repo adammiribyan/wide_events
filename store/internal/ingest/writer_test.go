@@ -99,13 +99,15 @@ func TestQueueChargesAggregateAndInFlightBytesWhileSerializingCommits(t *testing
 	require.NoError(t, <-results)
 	require.NoError(t, <-results)
 
+	require.Eventually(t, func() bool {
+		database.mutex.Lock()
+		defer database.mutex.Unlock()
+		return database.rejected == 1 && len(database.queued) > 0 && database.queued[len(database.queued)-1] == 0
+	}, time.Second, time.Millisecond)
 	database.mutex.Lock()
 	defer database.mutex.Unlock()
 	assert.Equal(t, 2, database.commits)
 	assert.Equal(t, 1, database.maxActive)
-	assert.Equal(t, uint64(1), database.rejected)
-	require.NotEmpty(t, database.queued)
-	assert.Zero(t, database.queued[len(database.queued)-1])
 }
 
 func TestCancelledSubmitLeavesAdmittedCommitOwnedByWriter(t *testing.T) {
@@ -145,7 +147,7 @@ func TestNoSpaceCommitErrorIsTypedForHTTPMapping(t *testing.T) {
 	assert.ErrorIs(t, err, syscall.ENOSPC)
 }
 
-func TestDuckDBIOCommitErrorIsTypedForHTTPMapping(t *testing.T) {
+func TestGenericDuckDBIOCommitErrorRemainsUnavailable(t *testing.T) {
 	batch, canonical := validBatch(t)
 	database := newBlockingDatabase()
 	database.commitErr = &duckdb.Error{
@@ -157,10 +159,25 @@ func TestDuckDBIOCommitErrorIsTypedForHTTPMapping(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
 
 	_, err := writer.Submit(context.Background(), batch, canonical)
-	assert.ErrorIs(t, err, ErrInsufficientStorage)
+	assert.NotErrorIs(t, err, ErrInsufficientStorage)
 	var databaseError *duckdb.Error
 	assert.ErrorAs(t, err, &databaseError)
 	assert.Equal(t, duckdb.ErrorTypeIO, databaseError.Type)
+}
+
+func TestDuckDBNoSpaceMessageIsTypedForHTTPMapping(t *testing.T) {
+	batch, canonical := validBatch(t)
+	database := newBlockingDatabase()
+	database.commitErr = &duckdb.Error{
+		Type: duckdb.ErrorTypeIO,
+		Msg:  "IO Error: failed to write database block: No space left on device",
+	}
+	close(database.release)
+	writer := newWriter(database, int64(len(canonical)))
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+
+	_, err := writer.Submit(context.Background(), batch, canonical)
+	assert.ErrorIs(t, err, ErrInsufficientStorage)
 }
 
 func TestTelemetryCoalescesWithoutBlockingQueueAdmission(t *testing.T) {
