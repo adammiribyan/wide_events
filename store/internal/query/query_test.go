@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -65,7 +66,7 @@ func TestPolicyRejectsBypassCorpus(t *testing.T) {
 	}
 }
 
-func TestPolicyReliesOnLockedExternalAccessSettings(t *testing.T) {
+func TestPolicyRejectsExternalReaders(t *testing.T) {
 	executor := newTestExecutor(t, Limits{})
 	for _, statement := range []string{
 		"SELECT * FROM read_csv('/etc/passwd')",
@@ -77,10 +78,25 @@ func TestPolicyReliesOnLockedExternalAccessSettings(t *testing.T) {
 		t.Run(statement, func(t *testing.T) {
 			var output bytes.Buffer
 			_, err := executor.Execute(context.Background(), Request{ProtocolVersion: 1, SQL: statement, Format: "json"}, &output)
-			assert.Error(t, err)
-			assert.NotErrorIs(t, err, ErrReadOnlyRequired)
+			assert.ErrorIs(t, err, ErrReadOnlyRequired)
 		})
 	}
+}
+
+func TestPolicyRejectsReadersEvenInsideInternalBackupAllowlist(t *testing.T) {
+	root := t.TempDir()
+	database, err := storage.Open(context.Background(), config.Config{
+		Database: filepath.Join(root, "wide-events.duckdb"), Service: "checkout", Environment: "test", QueryTempBytes: 64 << 20,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	directory := filepath.Join(root, "backups")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	path := filepath.Join(directory, "operator-secret.csv")
+	require.NoError(t, os.WriteFile(path, []byte("secret\nprivate\n"), 0o600))
+	executor := NewExecutor(database, Limits{}, nil)
+	statement := "SELECT * FROM read_csv('" + strings.ReplaceAll(path, "'", "''") + "')"
+	assert.ErrorIs(t, executor.Validate(context.Background(), statement), ErrReadOnlyRequired)
 }
 
 func TestPolicyRejectsSideEffectsBeforeTheyChangeState(t *testing.T) {
@@ -242,8 +258,7 @@ func TestPolicyDoesNotApplyBuiltInNullExceptionsToPersistentTableMacros(t *testi
 		SQL:             "SELECT * FROM system.main.read_csv('/etc/passwd')",
 		Format:          "json",
 	}, &output)
-	assert.Error(t, err)
-	assert.NotErrorIs(t, err, ErrReadOnlyRequired)
+	assert.ErrorIs(t, err, ErrReadOnlyRequired)
 
 	for _, statement := range []string{
 		`SELECT * FROM malicious."range"()`,
@@ -556,6 +571,15 @@ type gateWriter struct {
 	once    sync.Once
 	started chan<- struct{}
 	release <-chan struct{}
+}
+
+func TestAdmissionHookMapsMaintenanceToUnavailable(t *testing.T) {
+	executor := NewExecutor(nil, Limits{}, nil)
+	executor.SetAdmissionHook(func(context.Context) (func(), error) {
+		return nil, errors.New("maintenance")
+	})
+	_, err := executor.Execute(context.Background(), Request{ProtocolVersion: 1, SQL: "SELECT 1", Format: "json"}, io.Discard)
+	assert.ErrorIs(t, err, ErrUnavailable)
 }
 
 func (writer *gateWriter) Write(value []byte) (int, error) {

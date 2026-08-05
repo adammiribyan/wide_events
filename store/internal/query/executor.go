@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"reflect"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,11 +56,21 @@ type ResultMeta struct {
 }
 
 type Executor struct {
-	database *storage.Database
-	limits   Limits
-	logger   *slog.Logger
-	active   chan struct{}
-	waiting  atomic.Int32
+	database      *storage.Database
+	limits        Limits
+	logger        *slog.Logger
+	active        chan struct{}
+	waiting       atomic.Int32
+	hookMutex     sync.RWMutex
+	admissionHook func(context.Context) (func(), error)
+}
+
+// SetAdmissionHook installs the maintenance admission used to pause queries
+// during exclusive backup copies.
+func (executor *Executor) SetAdmissionHook(hook func(context.Context) (func(), error)) {
+	executor.hookMutex.Lock()
+	executor.admissionHook = hook
+	executor.hookMutex.Unlock()
 }
 
 func NewExecutor(database *storage.Database, limits Limits, logger *slog.Logger) *Executor {
@@ -155,6 +166,18 @@ func (executor *Executor) Execute(ctx context.Context, request Request, output i
 
 	if request.ProtocolVersion != 1 || request.SQL == "" || (request.Format != "json" && request.Format != "csv") || output == nil {
 		return meta, ErrInvalidRequest
+	}
+	executor.hookMutex.RLock()
+	hook := executor.admissionHook
+	executor.hookMutex.RUnlock()
+	if hook != nil {
+		release, hookErr := hook(ctx)
+		if hookErr != nil {
+			return meta, fmt.Errorf("%w: %v", ErrUnavailable, hookErr)
+		}
+		if release != nil {
+			defer release()
+		}
 	}
 	if err := executor.acquire(ctx); err != nil {
 		return meta, err

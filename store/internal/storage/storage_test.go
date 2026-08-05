@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
+	"github.com/adammiribyan/wide_events/store/internal/disk"
 	"github.com/adammiribyan/wide_events/store/internal/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,6 +76,33 @@ func TestOpenLocksSecurityConfiguration(t *testing.T) {
 
 	_, err = db.sql.ExecContext(context.Background(), "SET enable_external_access = true")
 	require.Error(t, err)
+}
+
+func TestOpenBindsQuerySpillToLesserOfFourGiBAndQuarterVolume(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wide-events.duckdb")
+	db, err := Open(context.Background(), testConfig(path))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	space, err := (disk.StatFSProbe{}).Space(path)
+	require.NoError(t, err)
+	want := space.Total / 4
+	if want > 4<<30 {
+		want = 4 << 30
+	}
+	setting := queryString(t, db, "SELECT current_setting('max_temp_directory_size')::VARCHAR")
+	assert.Equal(t, want, parseDuckDBBytes(t, setting))
+}
+
+func parseDuckDBBytes(t *testing.T, value string) int64 {
+	t.Helper()
+	parts := strings.Fields(value)
+	require.Len(t, parts, 2)
+	number, err := strconv.ParseFloat(parts[0], 64)
+	require.NoError(t, err)
+	multiplier := map[string]float64{"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}[parts[1]]
+	require.NotZero(t, multiplier)
+	return int64(number * multiplier)
 }
 
 func TestEveryPooledConnectionUsesLockedSecurityConfiguration(t *testing.T) {
@@ -303,6 +333,48 @@ func TestStoreVersionCanBeInjectedIntoStatusRelation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "2.3.4", status.StoreVersion)
 	assert.Equal(t, "2.3.4", queryString(t, db, "SELECT store_version FROM wide_events_store_status"))
+}
+
+func TestRetainDeletesEventsByReceivedAtAndBothLedgersAtExactlySevenDays(t *testing.T) {
+	db := openTestDatabase(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	for _, receivedAt := range []time.Time{now.Add(-31 * 24 * time.Hour), now.Add(-30 * 24 * time.Hour)} {
+		_, err := db.sql.ExecContext(ctx, `INSERT INTO wide_events (
+			id, occurred_at, received_at, service, environment, kind, error, attributes
+		) VALUES (uuid(), ?, ?, 'billing', 'production', 'request', false, json('{}')::VARIANT)`, receivedAt, receivedAt)
+		require.NoError(t, err)
+	}
+	for _, committedAt := range []time.Time{now.Add(-8 * 24 * time.Hour), now.Add(-7 * 24 * time.Hour)} {
+		_, err := db.sql.ExecContext(ctx, "INSERT INTO wide_events_ingestion_batches VALUES (uuid(), ?)", committedAt)
+		require.NoError(t, err)
+		_, err = db.sql.ExecContext(ctx, "INSERT INTO wide_events_loss_reports VALUES (uuid(), 1, ?)", committedAt)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, db.Retain(ctx, now.Add(-30*24*time.Hour), now.Add(-7*24*time.Hour)))
+	assert.Equal(t, 1, queryInt(t, db, "SELECT count(*) FROM wide_events"))
+	assert.Equal(t, 1, queryInt(t, db, "SELECT count(*) FROM wide_events_ingestion_batches"))
+	assert.Equal(t, 1, queryInt(t, db, "SELECT count(*) FROM wide_events_loss_reports"))
+}
+
+func TestCreateBackupProducesAReadOnlyVerifiableCopy(t *testing.T) {
+	db := openTestDatabase(t)
+	ctx := context.Background()
+	require.NoError(t, commit(t, db, validBatch("01989a64-d4c2-7720-b228-b56053627101")))
+	directory := filepath.Join(filepath.Dir(db.path), "backups")
+	require.NoError(t, os.Mkdir(directory, 0o700))
+	path := filepath.Join(directory, "backup.duckdb")
+	require.NoError(t, db.CreateBackup(ctx, path))
+	require.FileExists(t, path)
+	require.NoError(t, db.VerifyBackup(ctx, path))
+}
+
+func TestVerifyBackupRejectsAnInvalidCopy(t *testing.T) {
+	db := openTestDatabase(t)
+	path := filepath.Join(t.TempDir(), "invalid.duckdb")
+	require.NoError(t, os.WriteFile(path, []byte("not duckdb"), 0o600))
+	assert.Error(t, db.VerifyBackup(context.Background(), path))
 }
 
 func TestCommittedBatchSurvivesCloseAndReopen(t *testing.T) {

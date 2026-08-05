@@ -37,17 +37,12 @@ type functionIdentity struct {
 	internal bool
 }
 
-// DuckDB 1.5.5 leaves has_side_effects NULL for these required built-in table
-// functions. range is an in-engine generator. The external readers are safe
-// only because storage locks enable_external_access=false before serving SQL.
-// Identity and kind are pinned so this exception never covers macros, aliases,
-// or user-defined objects with the same base name.
+// DuckDB 1.5.5 leaves has_side_effects NULL for the required range built-in.
+// External readers are deliberately not excepted: the owner process has a
+// narrow backup-directory allowlist, so policy must reject all public file
+// readers before their arguments reach the filesystem.
 var controlledNullFunctions = map[functionIdentity]struct{}{
-	{catalog: "system", schema: "main", name: "glob", kind: "table", internal: true}:         {},
-	{catalog: "system", schema: "main", name: "range", kind: "table", internal: true}:        {},
-	{catalog: "system", schema: "main", name: "read_csv", kind: "table", internal: true}:     {},
-	{catalog: "system", schema: "main", name: "read_json", kind: "table", internal: true}:    {},
-	{catalog: "system", schema: "main", name: "read_parquet", kind: "table", internal: true}: {},
+	{catalog: "system", schema: "main", name: "range", kind: "table", internal: true}: {},
 }
 
 func prepareReadOnly(ctx context.Context, connection any, sqlText string) (*duckdb.Stmt, error) {

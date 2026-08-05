@@ -36,6 +36,7 @@ type submission struct {
 	batch     protocol.Batch
 	canonical []byte
 	response  chan commitResponse
+	release   func()
 }
 
 type database interface {
@@ -50,12 +51,14 @@ type Writer struct {
 	database database
 	maxBytes int64
 
-	mutex       sync.Mutex
-	queue       []*submission
-	queuedBytes int64
-	closed      bool
-	wake        chan struct{}
-	done        chan struct{}
+	mutex         sync.Mutex
+	queue         []*submission
+	queuedBytes   int64
+	closed        bool
+	wake          chan struct{}
+	done          chan struct{}
+	admissionHook func(context.Context) (func(), error)
+	noSpaceHook   func(context.Context, error)
 
 	telemetryVersion uint64
 	pendingRejected  uint64
@@ -103,6 +106,21 @@ func (writer *Writer) ConfigureTenancyLogging(logger *slog.Logger, service, envi
 	writer.expectedEnvironment = environment
 }
 
+// SetAdmissionHook installs the maintenance/disk admission hook. The returned
+// release remains owned by the writer until an admitted commit completes.
+func (writer *Writer) SetAdmissionHook(hook func(context.Context) (func(), error)) {
+	writer.mutex.Lock()
+	writer.admissionHook = hook
+	writer.mutex.Unlock()
+}
+
+// SetNoSpaceHook publishes actual engine/OS exhaustion through maintenance.
+func (writer *Writer) SetNoSpaceHook(hook func(context.Context, error)) {
+	writer.mutex.Lock()
+	writer.noSpaceHook = hook
+	writer.mutex.Unlock()
+}
+
 // Submit admits one validated batch and waits for its commit result. Request
 // cancellation stops the wait, but already admitted work remains owned by the
 // writer and completes without spawning another goroutine.
@@ -114,22 +132,43 @@ func (writer *Writer) Submit(ctx context.Context, batch protocol.Batch, canonica
 		return storage.CommitResult{}, err
 	}
 
+	writer.mutex.Lock()
+	hook := writer.admissionHook
+	writer.mutex.Unlock()
+	release := func() {}
+	if hook != nil {
+		var err error
+		release, err = hook(ctx)
+		if err != nil {
+			if isInsufficientStorage(err) {
+				return storage.CommitResult{}, fmt.Errorf("%w: %v", ErrInsufficientStorage, err)
+			}
+			return storage.CommitResult{}, err
+		}
+		if release == nil {
+			release = func() {}
+		}
+	}
+
 	item := &submission{
 		batch:     batch,
 		canonical: canonical,
 		response:  make(chan commitResponse, 1),
+		release:   release,
 	}
 	charge := int64(len(canonical))
 
 	writer.mutex.Lock()
 	if writer.closed {
 		writer.mutex.Unlock()
+		release()
 		return storage.CommitResult{}, ErrClosed
 	}
 	if writer.maxBytes <= 0 || charge > writer.maxBytes || writer.queuedBytes > writer.maxBytes-charge {
 		writer.pendingRejected++
 		writer.telemetryVersion++
 		writer.mutex.Unlock()
+		release()
 		writer.signalTelemetry()
 		return storage.CommitResult{}, ErrQueueFull
 	}
@@ -212,6 +251,9 @@ func (writer *Writer) run() {
 
 		result, err := writer.database.CommitBatch(context.Background(), item.batch)
 		err = classifyCommitError(err)
+		if errors.Is(err, ErrInsufficientStorage) {
+			writer.notifyNoSpace(err)
+		}
 		if err == nil && result.TenancyMismatch && !result.Duplicate {
 			writer.logTenancyMismatch(item.batch)
 		}
@@ -221,8 +263,28 @@ func (writer *Writer) run() {
 		writer.telemetryVersion++
 		writer.mutex.Unlock()
 		writer.signalTelemetry()
+		item.release()
 		item.response <- commitResponse{result: result, err: err}
 	}
+}
+
+type insufficientStorage interface{ InsufficientStorage() bool }
+
+func isInsufficientStorage(err error) bool {
+	var marker insufficientStorage
+	return errors.As(err, &marker) && marker.InsufficientStorage()
+}
+
+func (writer *Writer) notifyNoSpace(err error) {
+	writer.mutex.Lock()
+	hook := writer.noSpaceHook
+	writer.mutex.Unlock()
+	if hook == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hook(ctx, err)
 }
 
 func (writer *Writer) logTenancyMismatch(batch protocol.Batch) {

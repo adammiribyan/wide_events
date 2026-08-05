@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
+	"github.com/adammiribyan/wide_events/store/internal/disk"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
@@ -20,6 +21,7 @@ type Database struct {
 	sql         *sql.DB
 	service     string
 	environment string
+	path        string
 }
 
 // Open initializes the configured DuckDB instance, applies pending migrations,
@@ -30,11 +32,16 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
 	tempDirectory := filepath.Join(filepath.Dir(databasePath), "tmp")
+	backupDirectory := filepath.Join(filepath.Dir(databasePath), "backups")
 	if err := os.MkdirAll(tempDirectory, 0o700); err != nil {
 		return nil, fmt.Errorf("create DuckDB temp directory: %w", err)
 	}
 
-	maxTempSize := strconv.FormatInt(cfg.QueryTempBytes, 10) + "B"
+	space, err := (disk.StatFSProbe{}).Space(databasePath)
+	if err != nil {
+		return nil, fmt.Errorf("probe database filesystem: %w", err)
+	}
+	maxTempSize := strconv.FormatInt(disk.QuerySpillLimit(space.Total), 10) + "B"
 	var initializeOnce sync.Once
 	var initializeErr error
 	dsn := databasePath + "?storage_compatibility_version=v1.5.0"
@@ -47,6 +54,7 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 				{query: "SET memory_limit = '1GiB'"},
 				{query: "SET temp_directory = ?", args: []driver.NamedValue{{Ordinal: 1, Value: tempDirectory}}},
 				{query: "SET max_temp_directory_size = ?", args: []driver.NamedValue{{Ordinal: 1, Value: maxTempSize}}},
+				{query: "SET allowed_directories = [?]", args: []driver.NamedValue{{Ordinal: 1, Value: backupDirectory}}},
 				{query: "SET enable_external_access = false"},
 				{query: "SET autoinstall_known_extensions = false"},
 				{query: "SET autoload_known_extensions = false"},
@@ -71,7 +79,7 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 	// for ingestion and maintenance in addition to the bounded query workers.
 	sqlDB.SetMaxOpenConns(3)
 	sqlDB.SetMaxIdleConns(3)
-	database := &Database{sql: sqlDB, service: cfg.Service, environment: cfg.Environment}
+	database := &Database{sql: sqlDB, service: cfg.Service, environment: cfg.Environment, path: databasePath}
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("connect to DuckDB: %w", err)

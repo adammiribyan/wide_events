@@ -507,3 +507,52 @@ func (database *flakyTelemetryDatabase) AddRejectedBatches(_ context.Context, co
 	database.rejected += count
 	return nil
 }
+
+func TestAdmissionHookRejectsBeforeQueueOwnership(t *testing.T) {
+	database := newBlockingDatabase()
+	writer := newWriter(database, 1024)
+	writer.SetAdmissionHook(func(context.Context) (func(), error) {
+		return nil, errors.New("maintenance")
+	})
+	_, err := writer.Submit(context.Background(), protocol.Batch{}, []byte("batch"))
+	assert.EqualError(t, err, "maintenance")
+	select {
+	case <-database.started:
+		t.Fatal("rejected admission reached database writer")
+	default:
+	}
+	close(database.release)
+	require.NoError(t, writer.Close(context.Background()))
+}
+
+func TestAdmissionOwnershipAndDiskCallbackLastThroughCommit(t *testing.T) {
+	database := newBlockingDatabase()
+	database.commitErr = syscall.ENOSPC
+	writer := newWriter(database, 1024)
+	released := make(chan struct{})
+	notified := make(chan error, 1)
+	writer.SetAdmissionHook(func(context.Context) (func(), error) {
+		return func() { close(released) }, nil
+	})
+	writer.SetNoSpaceHook(func(_ context.Context, err error) { notified <- err })
+	done := make(chan error, 1)
+	go func() {
+		_, err := writer.Submit(context.Background(), protocol.Batch{}, []byte("batch"))
+		done <- err
+	}()
+	<-database.started
+	select {
+	case <-released:
+		t.Fatal("writer released admission before commit completed")
+	default:
+	}
+	close(database.release)
+	assert.ErrorIs(t, <-done, ErrInsufficientStorage)
+	assert.ErrorIs(t, <-notified, ErrInsufficientStorage)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not release admission after commit")
+	}
+	require.NoError(t, writer.Close(context.Background()))
+}
