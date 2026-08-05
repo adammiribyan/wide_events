@@ -193,6 +193,25 @@ func TestReadOnlyTransactionBlocksDirectAndDynamicSequenceMutation(t *testing.T)
 	assert.Equal(t, int64(41), sequenceValue)
 }
 
+func TestPolicyRejectsMacroWithNullSideEffectMetadataBeforeSleep(t *testing.T) {
+	executor := newTestExecutor(t, Limits{})
+	const statement = "SELECT pg_sleep(1)"
+
+	started := time.Now()
+	err := executor.Validate(context.Background(), statement)
+	assert.ErrorIs(t, err, ErrReadOnlyRequired)
+	assert.Less(t, time.Since(started), 500*time.Millisecond)
+
+	started = time.Now()
+	_, err = executor.Execute(context.Background(), Request{
+		ProtocolVersion: 1,
+		SQL:             statement,
+		Format:          "json",
+	}, &bytes.Buffer{})
+	assert.ErrorIs(t, err, ErrReadOnlyRequired)
+	assert.Less(t, time.Since(started), 500*time.Millisecond)
+}
+
 func TestFifthWaiterGetsBusyWithoutEnteringActivePool(t *testing.T) {
 	limits := Limits{Active: 2, Waiting: 4, WaitTimeout: 2 * time.Second, ExecutionTimeout: 5 * time.Second}
 	executor := newTestExecutor(t, limits)
@@ -360,24 +379,34 @@ func TestDefaultResponseByteBoundary(t *testing.T) {
 
 func TestDefaultRowBoundary(t *testing.T) {
 	executor := newTestExecutor(t, Limits{})
-	for _, rowCount := range []int{defaultMaxRows, defaultMaxRows + 1} {
-		t.Run(fmt.Sprintf("rows_%d", rowCount), func(t *testing.T) {
-			var output bytes.Buffer
-			meta, err := executor.Execute(context.Background(), Request{
-				ProtocolVersion: 1,
-				SQL:             fmt.Sprintf("SELECT i FROM range(%d) AS values(i)", rowCount),
-				Format:          "json",
-			}, &output)
-			assert.Equal(t, defaultMaxRows, meta.Rows)
-			if rowCount == defaultMaxRows {
-				require.NoError(t, err)
-				assert.False(t, meta.Truncated)
-			} else {
-				assert.ErrorIs(t, err, ErrResultLimit)
-				assert.True(t, meta.Truncated)
+	for _, format := range []string{"json", "csv"} {
+		t.Run(format, func(t *testing.T) {
+			for _, rowCount := range []int{defaultMaxRows, defaultMaxRows + 1} {
+				t.Run(fmt.Sprintf("rows_%d", rowCount), func(t *testing.T) {
+					var output bytes.Buffer
+					meta, err := executor.Execute(context.Background(), Request{
+						ProtocolVersion: 1,
+						SQL:             fmt.Sprintf("SELECT i FROM range(%d) AS values(i)", rowCount),
+						Format:          format,
+					}, &output)
+					assert.Equal(t, defaultMaxRows, meta.Rows)
+					if rowCount == defaultMaxRows {
+						require.NoError(t, err)
+						assert.False(t, meta.Truncated)
+					} else {
+						assert.ErrorIs(t, err, ErrResultLimit)
+						assert.True(t, meta.Truncated)
+					}
+					if format == "json" {
+						var decoded any
+						assert.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
+					} else {
+						records, csvErr := csv.NewReader(&output).ReadAll()
+						require.NoError(t, csvErr)
+						assert.Len(t, records, defaultMaxRows+1)
+					}
+				})
 			}
-			var decoded any
-			assert.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
 		})
 	}
 }

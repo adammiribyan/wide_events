@@ -28,3 +28,5 @@ SELECT nextval('query_policy_sequence')
 SELECT * FROM query('DELETE FROM wide_events RETURNING id')
 ----
 SELECT * FROM query('SELECT nextval(''query_policy_sequence'')')
+----
+SELECT pg_sleep(1)

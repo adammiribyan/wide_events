@@ -20,6 +20,23 @@ var (
 	ErrUnavailable      = errors.New("query service unavailable")
 )
 
+// DuckDB 1.5.5 leaves has_side_effects NULL for these required table
+// functions. range is an in-engine generator. The external readers are safe
+// only because storage locks enable_external_access=false before serving SQL.
+// Keep this pinned exception set minimal; every other NULL remains rejected.
+type functionReference struct {
+	name    string
+	context string
+}
+
+var controlledNullFunctions = map[functionReference]struct{}{
+	{name: "glob", context: "table"}:         {},
+	{name: "range", context: "table"}:        {},
+	{name: "read_csv", context: "table"}:     {},
+	{name: "read_json", context: "table"}:    {},
+	{name: "read_parquet", context: "table"}: {},
+}
+
 func prepareReadOnly(ctx context.Context, connection any, sqlText string) (*duckdb.Stmt, error) {
 	duckConnection, ok := connection.(*duckdb.Conn)
 	if !ok {
@@ -73,53 +90,82 @@ func proveSingleSelect(ctx context.Context, connection *duckdb.Conn, sqlText str
 		return ErrReadOnlyRequired
 	}
 	functionNames := collectFunctions(statements[0])
-	for functionName := range functionNames {
-		if functionName == "query" {
+	for reference := range functionNames {
+		if reference.name == "query" {
 			// DuckDB's dynamic query table function is catalogued as pure, but
 			// can tunnel calls to side-effecting functions in its SQL string.
 			return ErrReadOnlyRequired
 		}
 		metadata, metadataErr := connection.QueryContext(ctx, `
-			SELECT count(*), coalesce(bool_or(has_side_effects), false)
+			SELECT
+				count(*),
+				count(has_side_effects),
+				coalesce(bool_or(has_side_effects), false)
 			FROM duckdb_functions()
 			WHERE function_name = ?::VARCHAR
-		`, []driver.NamedValue{{Ordinal: 1, Value: functionName}})
+				AND CASE
+					WHEN ?::VARCHAR = 'table' THEN function_type IN ('table', 'table_macro')
+					ELSE function_type NOT IN ('table', 'table_macro')
+				END
+		`, []driver.NamedValue{
+			{Ordinal: 1, Value: reference.name},
+			{Ordinal: 2, Value: reference.context},
+		})
 		if metadataErr != nil {
 			return fmt.Errorf("%w: function metadata unavailable", ErrReadOnlyRequired)
 		}
-		values := make([]driver.Value, 2)
+		values := make([]driver.Value, 3)
 		nextErr := metadata.Next(values)
 		closeErr := metadata.Close()
 		if nextErr != nil || closeErr != nil {
 			return fmt.Errorf("%w: function metadata invalid", ErrReadOnlyRequired)
 		}
-		count, countOK := values[0].(int64)
-		hasSideEffects, sideEffectsOK := values[1].(bool)
-		if !countOK || !sideEffectsOK || count == 0 || hasSideEffects {
+		overloadCount, overloadCountOK := values[0].(int64)
+		knownCount, knownCountOK := values[1].(int64)
+		hasSideEffects, sideEffectsOK := values[2].(bool)
+		if !overloadCountOK || !knownCountOK || !sideEffectsOK || overloadCount == 0 ||
+			hasSideEffects {
 			return ErrReadOnlyRequired
+		}
+		if knownCount != overloadCount {
+			if _, controlled := controlledNullFunctions[reference]; !controlled {
+				return ErrReadOnlyRequired
+			}
 		}
 	}
 	return nil
 }
 
-func collectFunctions(root any) map[string]struct{} {
-	names := make(map[string]struct{})
-	pending := []any{root}
+type astValue struct {
+	value   any
+	context string
+}
+
+func collectFunctions(root any) map[functionReference]struct{} {
+	names := make(map[functionReference]struct{})
+	pending := []astValue{{value: root, context: "expression"}}
 	for len(pending) > 0 {
-		value := pending[len(pending)-1]
+		item := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		switch typed := value.(type) {
+		switch typed := item.value.(type) {
 		case map[string]any:
 			if class, _ := typed["class"].(string); class == "FUNCTION" {
 				if name, _ := typed["function_name"].(string); name != "" {
-					names[strings.ToLower(name)] = struct{}{}
+					names[functionReference{name: strings.ToLower(name), context: item.context}] = struct{}{}
 				}
 			}
-			for _, child := range typed {
-				pending = append(pending, child)
+			tableFunction, _ := typed["type"].(string)
+			for key, child := range typed {
+				context := "expression"
+				if tableFunction == "TABLE_FUNCTION" && key == "function" {
+					context = "table"
+				}
+				pending = append(pending, astValue{value: child, context: context})
 			}
 		case []any:
-			pending = append(pending, typed...)
+			for _, child := range typed {
+				pending = append(pending, astValue{value: child, context: "expression"})
+			}
 		}
 	}
 	return names
