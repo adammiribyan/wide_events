@@ -7,6 +7,16 @@ require "socket"
 require "stringio"
 require "json"
 
+# Several tests below call WideEvent::Tasks::Store methods directly
+# (bypassing Rake::Task#invoke entirely, to drive the interactive/Readline
+# branch without a real terminal). That module is only ever *defined* by
+# loading tasks/store.rake — normally done lazily inside `with_rake` for
+# each example — so, with Minitest's random test order, a direct-call test
+# could run before any `with_rake`-based test ever loaded it, raising
+# NameError. Loading it once here, at file-load time, guarantees the
+# module exists before any test in this file runs, regardless of order.
+load File.expand_path("../lib/wide_event/tasks/store.rake", __dir__)
+
 class TasksTest < ActiveSupport::TestCase
   QUERY_TOKEN = "test-query-token"
 
