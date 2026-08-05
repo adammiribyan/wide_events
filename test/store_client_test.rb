@@ -22,9 +22,15 @@ class StoreClientTest < ActiveSupport::TestCase
     assert WideEvent::Store::Client.new(url: "http://localhost:9999", ingest_token: TOKEN)
   end
 
-  test "requires a non-blank ingest token" do
-    assert_raises(ArgumentError) { WideEvent::Store::Client.new(url: "https://example.com", ingest_token: "") }
-    assert_raises(ArgumentError) { WideEvent::Store::Client.new(url: "https://example.com", ingest_token: nil) }
+  test "requires a non-blank ingest token to ingest (not at construction — a query-only client has none)" do
+    assert WideEvent::Store::Client.new(url: "https://example.com", ingest_token: "")
+    assert WideEvent::Store::Client.new(url: "https://example.com", ingest_token: nil)
+
+    client = WideEvent::Store::Client.new(url: "https://example.com", ingest_token: "")
+    assert_raises(ArgumentError) { client.ingest(gzip("{}")) }
+
+    client = WideEvent::Store::Client.new(url: "https://example.com", ingest_token: nil)
+    assert_raises(ArgumentError) { client.ingest(gzip("{}")) }
   end
 
   test "sends the bearer token, content-type, and content-encoding, and never leaks the token in an error" do

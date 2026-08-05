@@ -100,6 +100,10 @@ module WideEvent
 
       raise ArgumentError, "WIDE_EVENTS_SERVICE is required for the store sink" if @store_service.to_s.strip.empty?
       raise ArgumentError, "WIDE_EVENTS_ENVIRONMENT is required for the store sink" if @store_environment.to_s.strip.empty?
+      # Client itself no longer validates token presence at construction
+      # (a query-only Client has no ingest token to give it) — the ingest
+      # path validates this here, at sink-resolution time, instead.
+      raise ArgumentError, "WIDE_EVENTS_INGEST_TOKEN is required for the store sink" if @store_ingest_token.to_s.strip.empty?
 
       client = WideEvent::Store::Client.new(url: @store_url, ingest_token: @store_ingest_token)
       @store_sender = WideEvent::Store::Sender.new(client: client, service: @store_service, environment: @store_environment)

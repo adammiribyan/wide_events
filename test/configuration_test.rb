@@ -164,6 +164,24 @@ class ConfigurationTest < ActiveSupport::TestCase
     assert_equal [ [ ArgumentError, "store_sink_configuration" ] ], errors
   end
 
+  test "sink :store without an ingest token falls back to a no-op sink and reports through handle_error" do
+    # Client no longer validates ingest_token presence at construction (a
+    # query-only Client legitimately has none) — build_store_sink must
+    # keep enforcing it itself for the ingest path.
+    config = WideEvent::Configuration.new
+    config.store_url = "https://store.example.com"
+    config.store_service = "checkout"
+    config.store_environment = "test"
+    config.store_ingest_token = nil
+    config.sink = :store
+
+    errors = []
+    config.error_handler = ->(e, msg) { errors << [ e.class, msg ] }
+
+    assert_nothing_raised { config.resolved_sink.flush({ "duration_ms" => 1.0 }) }
+    assert_equal [ [ ArgumentError, "store_sink_configuration" ] ], errors
+  end
+
   test "resolved? is false until resolved_sink has actually been called" do
     config = WideEvent::Configuration.new
     refute config.resolved?

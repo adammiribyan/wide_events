@@ -155,12 +155,21 @@ class TasksTest < ActiveSupport::TestCase
     end
   end
 
-  test "sql task aborts with setup guidance when the store url or query token is missing" do
-    WideEvent.configure { |c| c.store_url = nil; c.store_query_token = nil }
-    error = assert_raises(SystemExit) do
-      capture_io { invoke_store_task(stdin: StringIO.new("SELECT 1")) }
-    end
+  test "sql task aborts with setup guidance when the query token is missing (url present, no ingest token either)" do
+    # A query-only deployment: url is configured, ingest token is not (it
+    # must not be required to run wide_events:sql — see Client#query), but
+    # the query token is missing, which must abort with exact guidance.
+    WideEvent.configure { |c| c.store_url = "https://store.example.com"; c.store_ingest_token = nil; c.store_query_token = nil }
+    error, stderr = abort_message { invoke_store_task(stdin: StringIO.new("SELECT 1")) }
     refute error.success?
+    assert_match(/WIDE_EVENTS_QUERY_TOKEN/, stderr)
+  end
+
+  test "sql task aborts with setup guidance when the store url is missing" do
+    WideEvent.configure { |c| c.store_url = nil; c.store_query_token = QUERY_TOKEN }
+    error, stderr = abort_message { invoke_store_task(stdin: StringIO.new("SELECT 1")) }
+    refute error.success?
+    assert_match(/WIDE_EVENTS_URL/, stderr)
   end
 
   test "sql task aborts on a rejected piped query without leaking the token or a raw server body" do
@@ -192,6 +201,24 @@ class TasksTest < ActiveSupport::TestCase
     yield server
   ensure
     server&.close
+  end
+
+  # Runs `block`, expecting it to hit a Kernel#abort (raising SystemExit).
+  # Rescuing SystemExit *inside* the capture_io block (rather than wrapping
+  # capture_io in assert_raises, as the registry:check tests do) lets us
+  # get the captured stderr text back too, so tests can assert on the
+  # exact setup-guidance message instead of only the non-zero exit.
+  def abort_message
+    error = nil
+    _stdout, stderr = capture_io do
+      begin
+        yield
+      rescue SystemExit => e
+        error = e
+      end
+    end
+    refute_nil error, "expected the block to abort (raise SystemExit)"
+    [ error, stderr ]
   end
 
   def invoke_store_task(stdin:)

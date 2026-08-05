@@ -92,6 +92,18 @@ class StoreQueryTest < ActiveSupport::TestCase
     end
   end
 
+  test "queries with no ingest token at all — a query-only client never needs one" do
+    with_fake_server([ [ 200, {}, query_json(rows: [ [ 1 ] ]) ] ]) do |server, _requests|
+      client = WideEvent::Store::Client.new(url: "http://127.0.0.1:#{server.port}", query_token: QUERY_TOKEN)
+      assert_equal [ [ 1 ] ], client.query("SELECT 1").rows
+    end
+  end
+
+  test "constructing a client without an ingest token does not raise (validated lazily by #ingest, not here)" do
+    assert WideEvent::Store::Client.new(url: "https://example.com", query_token: QUERY_TOKEN)
+    assert WideEvent::Store::Client.new(url: "https://example.com")
+  end
+
   test "never includes the query token or sql text in a raised error message" do
     with_fake_server([ [ 400, {}, { error: "Bad Request" }.to_json ] ]) do |server, _requests|
       secret_sql = "SELECT super_secret_column FROM wide_events"

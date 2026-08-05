@@ -54,7 +54,11 @@ module WideEvent
         OpenSSL::SSL::SSLError, EOFError, IOError
       ].freeze
 
-      def initialize(url:, ingest_token:, query_token: nil, open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT)
+      # Token presence is validated per-operation (in #ingest and #query),
+      # not here: a Client built only to query has no ingest token to give
+      # it, and vice versa. The constructor still validates the URL, since
+      # that's shared by both operations and needed before either can run.
+      def initialize(url:, ingest_token: nil, query_token: nil, open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT)
         @uri = URI.parse(url.to_s)
         raise ArgumentError, "store url must be an absolute http(s) URL" unless @uri.host
 
@@ -63,8 +67,6 @@ module WideEvent
         end
 
         @ingest_token = ingest_token.to_s
-        raise ArgumentError, "store ingest token is required" if @ingest_token.empty?
-
         @query_token = query_token.to_s
         @open_timeout = open_timeout
         @read_timeout = read_timeout
@@ -73,6 +75,7 @@ module WideEvent
       # Sends one already-gzipped canonical batch body. Returns an Ack on a
       # 200 response; raises Error (tagged retryable?) otherwise.
       def ingest(gzip_body)
+        raise ArgumentError, "store ingest token is required" if @ingest_token.empty?
         code, body = perform(gzip_body)
         handle_response(code, body)
       end
