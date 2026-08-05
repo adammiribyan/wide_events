@@ -137,6 +137,30 @@ func TestAdminClientDelegatesBackupOverPrivateSocket(t *testing.T) {
 	}
 }
 
+func TestAdminContextCancellationStopsListenerAndRemovesSocket(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "we-admin-shutdown-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "admin.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ListenContext(ctx, socket, 0o600, &fakeAdminManager{}) }()
+	require.Eventually(t, func() bool {
+		_, err := os.Lstat(socket)
+		return err == nil
+	}, time.Second, 5*time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("canceled admin listener did not stop")
+	}
+	_, err = os.Lstat(socket)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestAdminClientRejectsUnknownCommandsWithoutConnecting(t *testing.T) {
 	assert.Equal(t, 2, RunClient(filepath.Join(t.TempDir(), "missing.sock"), []string{"unknown"}, io.Discard, io.Discard))
 }

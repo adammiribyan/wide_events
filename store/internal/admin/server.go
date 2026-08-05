@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -47,6 +48,16 @@ type backupCapacityError interface {
 // Listen binds a private Unix socket and serves bounded newline-delimited JSON
 // requests. It returns when the listener fails.
 func Listen(socket string, mode fs.FileMode, manager AdminManager) error {
+	return ListenContext(context.Background(), socket, mode, manager)
+}
+
+// ListenContext serves the private protocol until ctx is canceled. Canceling
+// also closes the active connection so an in-flight backup observes its
+// request cancellation before the listener returns.
+func ListenContext(ctx context.Context, socket string, mode fs.FileMode, manager AdminManager) error {
+	if ctx == nil {
+		return fmt.Errorf("admin context is required")
+	}
 	if manager == nil {
 		return fmt.Errorf("admin manager is required")
 	}
@@ -74,12 +85,42 @@ func Listen(socket string, mode fs.FileMode, manager AdminManager) error {
 			return fmt.Errorf("set admin socket owner: %w", err)
 		}
 	}
+	var activeMutex sync.Mutex
+	var active net.Conn
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			activeMutex.Lock()
+			if active != nil {
+				_ = active.Close()
+			}
+			activeMutex.Unlock()
+		case <-stopped:
+		}
+	}()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("accept admin connection: %w", err)
 		}
+		activeMutex.Lock()
+		if ctx.Err() != nil {
+			activeMutex.Unlock()
+			_ = connection.Close()
+			return nil
+		}
+		active = connection
+		activeMutex.Unlock()
 		handle(connection, manager)
+		activeMutex.Lock()
+		active = nil
+		activeMutex.Unlock()
 	}
 }
 
