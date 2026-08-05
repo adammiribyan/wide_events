@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -33,6 +34,118 @@ type Status struct {
 	DuckDBVersion         string
 }
 
+// UpdateCapacity publishes the latest size of the database file and free bytes
+// on its filesystem without exposing the underlying SQL handle.
+func (database *Database) UpdateCapacity(ctx context.Context, databaseFileBytes, freeDiskBytes int64) error {
+	if databaseFileBytes < 0 || freeDiskBytes < 0 {
+		return fmt.Errorf("capacity bytes must be non-negative")
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET database_file_bytes = ?, free_disk_bytes = ?
+		WHERE singleton
+	`, databaseFileBytes, freeDiskBytes); err != nil {
+		return fmt.Errorf("update store capacity: %w", err)
+	}
+	return nil
+}
+
+// SetQueuedIngestBytes publishes the current canonical-byte queue occupancy.
+func (database *Database) SetQueuedIngestBytes(ctx context.Context, queuedBytes int64) error {
+	if queuedBytes < 0 {
+		return fmt.Errorf("queued ingest bytes must be non-negative")
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state SET queued_ingest_bytes = ? WHERE singleton
+	`, queuedBytes); err != nil {
+		return fmt.Errorf("update queued ingest bytes: %w", err)
+	}
+	return nil
+}
+
+// AddRejectedBatches adds newly rejected admissions to the lifetime counter.
+func (database *Database) AddRejectedBatches(ctx context.Context, count uint64) error {
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET rejected_batches = rejected_batches + ?::UBIGINT
+		WHERE singleton
+	`, strconv.FormatUint(count, 10)); err != nil {
+		return fmt.Errorf("update rejected batch total: %w", err)
+	}
+	return nil
+}
+
+// SetWriteReady publishes whether writes may be admitted and why not.
+func (database *Database) SetWriteReady(ctx context.Context, ready bool, reason string) error {
+	if ready {
+		reason = ""
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET write_ready = ?, degradation_reason = ?
+		WHERE singleton
+	`, ready, reason); err != nil {
+		return fmt.Errorf("update write readiness: %w", err)
+	}
+	return nil
+}
+
+// RecordRetention publishes a retention result. A successful result advances
+// the timestamp and clears the previous maintenance error; a failed result
+// preserves the previous successful timestamp and records the error.
+func (database *Database) RecordRetention(ctx context.Context, completedAt time.Time, result error) error {
+	if result != nil {
+		if _, err := database.sql.ExecContext(ctx, `
+			UPDATE wide_events_store_state SET last_maintenance_error = ? WHERE singleton
+		`, result.Error()); err != nil {
+			return fmt.Errorf("record retention error: %w", err)
+		}
+		return nil
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET last_retention_at = ?, last_maintenance_error = NULL
+		WHERE singleton
+	`, completedAt); err != nil {
+		return fmt.Errorf("record retention success: %w", err)
+	}
+	return nil
+}
+
+// RecordBackup publishes a backup result with the same success/error semantics
+// as RecordRetention, using the backup-specific status fields.
+func (database *Database) RecordBackup(ctx context.Context, completedAt time.Time, result error) error {
+	if result != nil {
+		if _, err := database.sql.ExecContext(ctx, `
+			UPDATE wide_events_store_state SET last_backup_error = ? WHERE singleton
+		`, result.Error()); err != nil {
+			return fmt.Errorf("record backup error: %w", err)
+		}
+		return nil
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET last_backup_at = ?, last_backup_error = NULL
+		WHERE singleton
+	`, completedAt); err != nil {
+		return fmt.Errorf("record backup success: %w", err)
+	}
+	return nil
+}
+
+// SetStoreVersion publishes the semantic version injected by the executable.
+func (database *Database) SetStoreVersion(ctx context.Context, version string) error {
+	if version == "" {
+		return fmt.Errorf("store version must not be empty")
+	}
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state SET store_version = ? WHERE singleton
+	`, version); err != nil {
+		return fmt.Errorf("update store version: %w", err)
+	}
+	return nil
+}
+
 // PruneLedger removes only batch and loss-report ledger entries strictly older
 // than seven days. Entries exactly on the boundary remain deduplication keys.
 func (database *Database) PruneLedger(ctx context.Context, now time.Time) (err error) {
@@ -51,6 +164,13 @@ func (database *Database) PruneLedger(ctx context.Context, now time.Time) (err e
 		if _, err = tx.ExecContext(ctx, query, now); err != nil {
 			return fmt.Errorf("prune %s: %w", table, err)
 		}
+	}
+	if _, err = tx.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET last_retention_at = ?, last_maintenance_error = NULL
+		WHERE singleton
+	`, now); err != nil {
+		return fmt.Errorf("record ledger pruning status: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit ledger pruning: %w", err)
