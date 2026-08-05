@@ -127,6 +127,29 @@ class ConfigurationTest < ActiveSupport::TestCase
     config.shutdown_store_sender!
   end
 
+  test "re-resolving :store shuts down the previously built sender instead of leaking its worker thread" do
+    config = WideEvent::Configuration.new
+    config.store_url = "https://store.example.com"
+    config.store_service = "checkout"
+    config.store_environment = "test"
+    config.store_ingest_token = "token"
+    config.sink = :store
+
+    config.resolved_sink
+    first_sender = config.instance_variable_get(:@store_sender)
+    first_thread = first_sender.instance_variable_get(:@thread)
+    assert first_thread.alive?, "the first sender's worker thread should be running"
+
+    config.sink = :store # any assignment clears @resolved_sink, forcing a rebuild on the next call
+    config.resolved_sink
+    second_sender = config.instance_variable_get(:@store_sender)
+
+    refute_same first_sender, second_sender
+    refute first_thread.alive?, "the previous sender's worker thread should have been shut down, not leaked"
+  ensure
+    config.shutdown_store_sender!
+  end
+
   test "sink :store without a service falls back to a no-op sink and reports through handle_error" do
     config = WideEvent::Configuration.new
     config.store_url = "https://store.example.com"

@@ -123,6 +123,7 @@ module WideEvent
       def reset_state_locked
         @queue = []
         @queue_bytes = 0
+        @queue_started_at = nil
         @pending_drops = 0
         @loss_report_id = nil
         @last_drop_warning_at = nil
@@ -143,6 +144,7 @@ module WideEvent
       end
 
       def admit_locked(event_json)
+        @queue_started_at = @clock.call if @queue.empty?
         bytes = event_json.bytesize
         @queue << event_json
         @queue_bytes += bytes
@@ -188,6 +190,14 @@ module WideEvent
           if shutting_down
             break unless work_remaining?
             break if deadline && monotonic_now >= deadline
+            # Still honor any pending retry backoff (clamped to the shutdown
+            # deadline) instead of spinning: without this, a store that
+            # answers instantly with a failure (e.g. a stopped local
+            # sidecar giving immediate ECONNREFUSED) turns the drain into an
+            # unthrottled busy loop that hammers the store and floods the
+            # error handler for the whole shutdown window.
+            wait_for_retry_during_shutdown(deadline)
+            break if deadline && monotonic_now >= deadline
             tick(force: true)
             next
           end
@@ -196,6 +206,15 @@ module WideEvent
         end
       rescue StandardError => e
         WideEvent.handle_error(e, "store_sender_worker")
+      end
+
+      def wait_for_retry_during_shutdown(deadline)
+        @mutex.synchronize do
+          return unless @in_flight && @next_attempt_at
+          wait_until = deadline ? [ @next_attempt_at, deadline ].min : @next_attempt_at
+          remaining = wait_until - monotonic_now
+          @cv.wait(@mutex, remaining) if remaining.positive?
+        end
       end
 
       def work_remaining?
@@ -215,6 +234,10 @@ module WideEvent
           remaining = @next_attempt_at - monotonic_now
           return remaining.clamp(0.01, @flush_interval) if remaining.positive?
         end
+        if @queue_started_at && !@queue.empty?
+          remaining = @flush_interval - (@clock.call - @queue_started_at)
+          return remaining.clamp(0.01, @flush_interval) if remaining.positive?
+        end
         @flush_interval
       end
 
@@ -231,7 +254,7 @@ module WideEvent
           elsif !force && @in_flight && @next_attempt_at && monotonic_now < @next_attempt_at
             return nil
           else
-            batch = next_batch_locked
+            batch = next_batch_locked(force: force)
           end
         end
         if expired_batch
@@ -250,17 +273,31 @@ module WideEvent
         (@clock.call - batch.sealed_at) > @max_retry_age
       end
 
-      def next_batch_locked
+      def next_batch_locked(force:)
         return @in_flight if @in_flight
 
         batch = @overflow.shift
         unless batch
+          return nil unless force || seal_ready_locked?
           sealed = seal_locked
           return nil if sealed.empty?
           batch = sealed.shift
           @overflow.concat(sealed)
         end
         @in_flight = batch
+      end
+
+      # Only actually seal once the queue has reached the batch's size caps
+      # or the oldest queued event has been waiting flush_interval seconds —
+      # otherwise every enqueue's wakeup would immediately seal-and-send
+      # that single event as its own request, defeating the batch protocol
+      # under normal (sub-flush_interval) traffic. `force` (flush_once, and
+      # the shutdown drain) bypasses this and seals whatever is queued.
+      def seal_ready_locked?
+        return false if @queue.empty?
+        return true if @queue.length >= @max_batch_events
+        return true if @queue_bytes >= @max_batch_bytes
+        @queue_started_at && (@clock.call - @queue_started_at) >= @flush_interval
       end
 
       def seal_locked
@@ -275,6 +312,7 @@ module WideEvent
           bytes += candidate_bytes
           @queue_bytes -= candidate_bytes
         end
+        @queue_started_at = @queue.empty? ? nil : @clock.call
 
         drop_count = @pending_drops
         loss_report_id = drop_count.positive? ? (@loss_report_id ||= @uuid.call) : nil

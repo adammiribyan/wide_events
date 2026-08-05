@@ -91,6 +91,13 @@ module WideEvent
     private
 
     def build_store_sink
+      # A prior resolution (e.g. `config.sink = :store` twice, or
+      # re-assigning store_* fields and re-resolving) may have already
+      # built and started a sender; shut it down before replacing it so
+      # its worker thread and queue don't strand themselves, ownerless and
+      # retrying forever.
+      shutdown_store_sender!
+
       raise ArgumentError, "WIDE_EVENTS_SERVICE is required for the store sink" if @store_service.to_s.strip.empty?
       raise ArgumentError, "WIDE_EVENTS_ENVIRONMENT is required for the store sink" if @store_environment.to_s.strip.empty?
 
