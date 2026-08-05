@@ -8,8 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/adammiribyan/wide_events/store/internal/admin"
@@ -53,13 +51,15 @@ func run(args []string) int {
 }
 
 func serve() error {
-	return serveWithProbe(disk.StatFSProbe{})
+	return serveWithProbe(processProbe())
 }
 
 func serveWithProbe(probe disk.Probe) (result error) {
 	if probe == nil {
 		return fmt.Errorf("disk capacity probe is required")
 	}
+	processContext, stopSignals := terminationContext()
+	defer stopSignals()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
@@ -73,8 +73,14 @@ func serveWithProbe(probe disk.Probe) (result error) {
 	} else if cfg.QueryTempBytes > spillLimit {
 		cfg.QueryTempBytes = spillLimit
 	}
+	if err := beforeDatabaseOpen(processContext); err != nil {
+		return fmt.Errorf("database startup canceled: %w", err)
+	}
+	if err := processContext.Err(); err != nil {
+		return fmt.Errorf("database startup canceled: %w", err)
+	}
 
-	startupContext, startupCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	startupContext, startupCancel := context.WithTimeout(processContext, shutdownTimeout)
 	database, err := storage.Open(startupContext, cfg)
 	startupCancel()
 	if err != nil {
@@ -87,7 +93,7 @@ func serveWithProbe(probe disk.Probe) (result error) {
 		}
 	}()
 
-	versionContext, versionCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	versionContext, versionCancel := context.WithTimeout(processContext, shutdownTimeout)
 	err = database.SetStoreVersion(versionContext, version)
 	versionCancel()
 	if err != nil {
@@ -105,29 +111,32 @@ func serveWithProbe(probe disk.Probe) (result error) {
 	manager := maintenance.NewManager(maintenance.Dependencies{
 		Config: cfg, Database: database, Writer: writer, Queries: queries, Probe: probe, Logger: logger,
 	})
-	handler := httpapi.New(cfg, httpapi.Dependencies{
+	handler := wrapProcessHandler(httpapi.New(cfg, httpapi.Dependencies{
 		Database: database, Writer: writer, Query: queries, Recovery: manager, Logger: logger,
-	})
+	}), database)
+	tracker := newHandlerTracker(handler)
+	handlerRoot, cancelHandlerRoot := context.WithCancel(context.Background())
+	defer cancelHandlerRoot()
 
 	adminContext, stopAdmin := context.WithCancel(context.Background())
 	adminResult := make(chan error, 1)
 	go func() {
 		adminResult <- admin.ListenContext(adminContext, cfg.AdminSocket, 0o600, manager)
 	}()
-	if err, stopped := waitForAdmin(cfg.AdminSocket, adminResult); err != nil {
+	if err, stopped := waitForAdmin(processContext, cfg.AdminSocket, adminResult); err != nil {
 		stopAdmin()
 		wait := (<-chan error)(adminResult)
 		if stopped {
 			wait = nil
 		}
-		shutdownErr := shutdown(writer, manager, nil, stopAdmin, wait, database)
+		shutdownErr := shutdown(writer, manager, nil, nil, nil, nil, stopAdmin, wait, database)
 		databaseOpen = false
 		return errors.Join(err, shutdownErr)
 	}
 
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		shutdownErr := shutdown(writer, manager, nil, stopAdmin, adminResult, database)
+		shutdownErr := shutdown(writer, manager, nil, nil, nil, nil, stopAdmin, adminResult, database)
 		databaseOpen = false
 		return errors.Join(fmt.Errorf("listen on %s: %w", cfg.Listen, err), shutdownErr)
 	}
@@ -136,39 +145,42 @@ func serveWithProbe(probe disk.Probe) (result error) {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return handlerRoot
+		},
 	}
+	httpServer.Handler = tracker
 	httpResult := make(chan error, 1)
 	go func() { httpResult <- httpServer.Serve(listener) }()
 	manager.Start()
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-
 	var trigger error
 	select {
-	case <-signals:
+	case <-processContext.Done():
 	case err := <-httpResult:
 		if !errors.Is(err, http.ErrServerClosed) {
 			trigger = fmt.Errorf("HTTP server stopped: %w", err)
 		}
+		httpResult = nil
 	case err := <-adminResult:
 		trigger = fmt.Errorf("admin server stopped: %w", err)
 		adminResult = nil
 	}
 
-	shutdownErr := shutdown(writer, manager, httpServer, stopAdmin, adminResult, database)
+	shutdownErr := shutdown(writer, manager, httpServer, httpResult, cancelHandlerRoot, tracker, stopAdmin, adminResult, database)
 	databaseOpen = false
 	return errors.Join(trigger, shutdownErr)
 }
 
-func waitForAdmin(socket string, result <-chan error) (err error, stopped bool) {
+func waitForAdmin(ctx context.Context, socket string, result <-chan error) (err error, stopped bool) {
 	deadline := time.NewTimer(shutdownTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return fmt.Errorf("start admin server: %w", ctx.Err()), false
 		case err := <-result:
 			if err == nil {
 				return fmt.Errorf("admin server stopped during startup"), true
@@ -192,17 +204,23 @@ func shutdown(
 	writer *ingest.Writer,
 	manager *maintenance.Manager,
 	httpServer *http.Server,
+	httpResult <-chan error,
+	cancelHandlerRoot context.CancelFunc,
+	tracker *handlerTracker,
 	stopAdmin context.CancelFunc,
 	adminResult <-chan error,
 	database *storage.Database,
-) error {
-	var result error
+) (result error) {
 	if httpServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), writerDrainTimeout)
-		result = errors.Join(result, httpServer.Shutdown(ctx))
-		cancel()
+		safe, httpErr := stopHTTP(httpServer, httpResult, cancelHandlerRoot, tracker)
+		result = errors.Join(result, httpErr)
+		if !safe {
+			return result
+		}
 	}
 
+	beforeWriterShutdown()
+	recordProcessStage("writer-stop")
 	writerContext, cancelWriter := context.WithTimeout(context.Background(), writerDrainTimeout)
 	result = errors.Join(result, writer.Close(writerContext))
 	cancelWriter()
@@ -218,9 +236,11 @@ func shutdown(
 		}
 	}
 
+	recordProcessStage("checkpoint")
 	checkpointContext, cancelCheckpoint := context.WithTimeout(context.Background(), shutdownTimeout)
 	result = errors.Join(result, database.Checkpoint(checkpointContext))
 	cancelCheckpoint()
+	recordProcessStage("database-close")
 	result = errors.Join(result, database.Close())
 	return result
 }

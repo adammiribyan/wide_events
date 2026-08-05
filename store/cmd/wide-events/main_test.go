@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adammiribyan/wide_events/store/internal/disk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,17 +26,13 @@ const (
 )
 
 func TestServerLifecycle(t *testing.T) {
-	t.Parallel()
 	root := t.TempDir()
-	binary := filepath.Join(root, "wide-events")
-	build := exec.Command("go", "build", "-ldflags", "-X main.version=1.2.3-test", "-o", binary, ".")
-	buildOutput, err := build.CombinedOutput()
-	require.NoError(t, err, string(buildOutput))
+	binary := buildServer(t, root)
 
 	database := filepath.Join(root, "wide-events.duckdb")
 	socket := filepath.Join(root, "admin.sock")
 	address := unusedAddress(t)
-	server := startServer(t, address, database, socket)
+	server := startServer(t, binary, address, database, socket, nil)
 	waitForUp(t, address)
 
 	postJSON(t, address+"/v1/events", testIngestToken, `{
@@ -80,7 +75,7 @@ func TestServerLifecycle(t *testing.T) {
 	// A second process must reopen the cleanly checkpointed database and serve
 	// the committed row before it too can shut down safely.
 	address = unusedAddress(t)
-	server = startServer(t, address, database, socket)
+	server = startServer(t, binary, address, database, socket, nil)
 	waitForUp(t, address)
 	queryResult = postJSON(t, address+"/v1/query", testQueryToken,
 		`{"protocol_version":1,"sql":"SELECT count(*) AS count, (SELECT store_version FROM wide_events_store_status) AS store_version FROM wide_events","format":"json"}`)
@@ -88,25 +83,106 @@ func TestServerLifecycle(t *testing.T) {
 	stopServer(t, server)
 }
 
-func TestServerHelperProcess(t *testing.T) {
-	if os.Getenv("WIDE_EVENTS_TEST_HELPER") != "server" {
-		return
+func TestShutdownTimeoutCancelsAndJoinsHandlersBeforeDatabaseClose(t *testing.T) {
+	root := shortTempDir(t)
+	binary := buildServer(t, root)
+	database := filepath.Join(root, "wide-events.duckdb")
+	socket := filepath.Join(root, "admin.sock")
+	address := unusedAddress(t)
+	stages := filepath.Join(root, "stages.log")
+	server := startServer(t, binary, address, database, socket, []string{
+		"WIDE_EVENTS_TESTPROBE_STAGE_FILE=" + stages,
+		"WIDE_EVENTS_TESTPROBE_BLOCK_HANDLER=1",
+		"WIDE_EVENTS_TESTPROBE_SHUTDOWN_TIMEOUT=100ms",
+	})
+	waitForUp(t, address)
+
+	requestDone := make(chan error, 1)
+	go func() {
+		response, err := (&http.Client{Timeout: 10 * time.Second}).Get("http://" + address + "/testprobe/block")
+		if err == nil {
+			_ = response.Body.Close()
+		}
+		requestDone <- err
+	}()
+	waitForStage(t, stages, "handler-start")
+	require.NoError(t, server.Process.Signal(syscall.SIGTERM))
+	err := waitForProcess(t, server, 10*time.Second)
+	var exitError *exec.ExitError
+	require.ErrorAs(t, err, &exitError)
+	assert.Equal(t, 1, exitError.ExitCode())
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked HTTP client did not finish after forced connection close")
 	}
-	version = "1.2.3-test"
-	require.NoError(t, serveWithProbe(fixedCapacityProbe{}))
+	assertStageOrder(t, stages, "handler-start", "http-shutdown-timeout", "handler-root-canceled")
+	assertStageOrder(t, stages, "handler-root-canceled", "handler-db-access-ok", "handler-stop", "http-handlers-stopped", "writer-stop", "checkpoint", "database-close")
+	assertStageOrder(t, stages, "handler-root-canceled", "http-serve-stopped", "writer-stop")
 }
 
-type fixedCapacityProbe struct{}
-
-func (fixedCapacityProbe) Space(string) (disk.Space, error) {
-	return disk.Space{Total: 50 << 30, Free: 20 << 30}, nil
+func TestSignalDuringStartupCancelsBeforeDatabaseOpen(t *testing.T) {
+	root := shortTempDir(t)
+	binary := buildServer(t, root)
+	database := filepath.Join(root, "wide-events.duckdb")
+	stages := filepath.Join(root, "stages.log")
+	server := startServer(t, binary, unusedAddress(t), database, filepath.Join(root, "admin.sock"), []string{
+		"WIDE_EVENTS_TESTPROBE_STAGE_FILE=" + stages,
+		"WIDE_EVENTS_TESTPROBE_BLOCK_STARTUP=1",
+	})
+	waitForStage(t, stages, "startup-blocked")
+	require.NoError(t, server.Process.Signal(syscall.SIGTERM))
+	err := waitForProcess(t, server, 5*time.Second)
+	var exitError *exec.ExitError
+	require.ErrorAs(t, err, &exitError)
+	assert.Equal(t, 1, exitError.ExitCode())
+	assertStageOrder(t, stages, "startup-blocked", "startup-canceled")
+	assert.NoFileExists(t, database)
 }
 
-func startServer(t *testing.T, address, database, socket string) *exec.Cmd {
+func TestSecondSignalForceTerminatesStuckShutdown(t *testing.T) {
+	root := shortTempDir(t)
+	binary := buildServer(t, root)
+	stages := filepath.Join(root, "stages.log")
+	address := unusedAddress(t)
+	server := startServer(t, binary, address, filepath.Join(root, "wide-events.duckdb"), filepath.Join(root, "admin.sock"), []string{
+		"WIDE_EVENTS_TESTPROBE_STAGE_FILE=" + stages,
+		"WIDE_EVENTS_TESTPROBE_BLOCK_BEFORE_WRITER=1",
+	})
+	waitForUp(t, address)
+	require.NoError(t, server.Process.Signal(syscall.SIGTERM))
+	waitForStage(t, stages, "before-writer")
+	require.NoError(t, server.Process.Signal(syscall.SIGTERM))
+	err := waitForProcess(t, server, 5*time.Second)
+	var exitError *exec.ExitError
+	require.ErrorAs(t, err, &exitError)
+	waitStatus, ok := exitError.ProcessState.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	assert.True(t, waitStatus.Signaled())
+	assert.Equal(t, syscall.SIGTERM, waitStatus.Signal())
+}
+
+func buildServer(t *testing.T, root string) string {
 	t.Helper()
-	command := exec.Command(os.Args[0], "-test.run=^TestServerHelperProcess$")
+	binary := filepath.Join(root, "wide-events")
+	build := exec.Command("go", "build", "-tags", "testprobe", "-ldflags", "-X main.version=1.2.3-test", "-o", binary, ".")
+	buildOutput, err := build.CombinedOutput()
+	require.NoError(t, err, string(buildOutput))
+	return binary
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "we-main-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+func startServer(t *testing.T, binary, address, database, socket string, extraEnv []string) *exec.Cmd {
+	t.Helper()
+	command := exec.Command(binary)
 	command.Env = append(os.Environ(),
-		"WIDE_EVENTS_TEST_HELPER=server",
 		"WIDE_EVENTS_LISTEN="+address,
 		"WIDE_EVENTS_DATABASE="+database,
 		"WIDE_EVENTS_SERVICE=checkout",
@@ -115,6 +191,7 @@ func startServer(t *testing.T, address, database, socket string) *exec.Cmd {
 		"WIDE_EVENTS_QUERY_TOKEN="+testQueryToken,
 		"WIDE_EVENTS_ADMIN_SOCKET="+socket,
 	)
+	command.Env = append(command.Env, extraEnv...)
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -124,6 +201,9 @@ func startServer(t *testing.T, address, database, socket string) *exec.Cmd {
 			_ = command.Process.Kill()
 			_, _ = command.Process.Wait()
 		}
+		if t.Failed() {
+			t.Logf("server output:\n%s", output.String())
+		}
 	})
 	return command
 }
@@ -131,14 +211,44 @@ func startServer(t *testing.T, address, database, socket string) *exec.Cmd {
 func stopServer(t *testing.T, command *exec.Cmd) {
 	t.Helper()
 	require.NoError(t, command.Process.Signal(syscall.SIGTERM))
+	require.NoError(t, waitForProcess(t, command, 10*time.Second))
+}
+
+func waitForProcess(t *testing.T, command *exec.Cmd, timeout time.Duration) error {
+	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
 	select {
 	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
+		return err
+	case <-time.After(timeout):
 		_ = command.Process.Kill()
-		t.Fatal("server did not finish graceful shutdown")
+		<-done
+		t.Fatal("server process did not exit")
+		return nil
+	}
+}
+
+func waitForStage(t *testing.T, path, stage string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		payload, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(payload), stage+"\n")
+	}, 10*time.Second, 10*time.Millisecond, "stage %q was not recorded", stage)
+}
+
+func assertStageOrder(t *testing.T, path string, stages ...string) {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	require.NoError(t, err)
+	log := string(payload)
+	offset := 0
+	for _, stage := range stages {
+		index := strings.Index(log[offset:], stage+"\n")
+		if !assert.NotEqual(t, -1, index, "stage %q missing or out of order in:\n%s", stage, log) {
+			return
+		}
+		offset += index + len(stage) + 1
 	}
 }
 
