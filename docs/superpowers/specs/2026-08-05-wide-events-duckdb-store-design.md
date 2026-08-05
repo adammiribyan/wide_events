@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-05
 
-**Status:** Revised design for review
+**Status:** Approved design
 
 **Scope:** A default, self-hosted, SQL-queryable telemetry store for multi-host Rails applications deployed with Kamal
 
@@ -307,8 +307,13 @@ maximum retry horizon while bounding ledger growth.
 The sender includes its accumulated loss count in
 `dropped_events_since_last_batch`. The store increments the operational total
 only when it commits a previously unseen `batch_id`, so a retry cannot double
-count it. A process that never reconnects cannot report its final losses, which
-is an accepted limitation of the memory-only v1 sender.
+count it. The sender snapshots, but does not decrement, its pending loss counter
+when sealing a batch. A successful acknowledgement subtracts only that snapshot;
+losses accumulated while the batch was in flight remain pending. If the carrying
+batch is discarded after a permanent failure or the 24-hour retry horizon, its
+snapshot remains pending and is carried by the next batch. A process that never
+reconnects or exits before a later acknowledgement cannot report its final
+losses, which is an accepted limitation of the memory-only v1 sender.
 
 ## Delivery and Backpressure
 
@@ -403,10 +408,11 @@ An authenticated, read-only `wide_events_store_status` relation provides the
 operational facts needed to manage a store without a dashboard: rows received
 in the last hour and day; oldest and newest `received_at`; database-file and
 free-disk bytes; queued ingest bytes; rejected and client-reported dropped
-counts; ledger rows; last checkpoint, retention, and backup times; last
-maintenance error; and store, protocol, and DuckDB versions. It is backed by a
-one-row internal status table maintained by the service; queries do not gain
-filesystem or operating-system access.
+counts; ledger rows; `write_ready` and its degradation reason; last checkpoint,
+retention, and backup times; last maintenance and backup errors; and store,
+protocol, and DuckDB versions. It is backed by a one-row internal status table
+maintained by the service; queries do not gain filesystem or operating-system
+access.
 
 `bin/rails wide_events:sql` supports an interactive prompt and stdin. Query
 results support terminal-table, JSON, and CSV formats. The debugging skill is
@@ -432,10 +438,15 @@ The public service exposes only:
 
 - `POST /v1/events`, authenticated with the ingest token;
 - `POST /v1/query`, authenticated with the query token; and
-- `GET /up`, unauthenticated and limited to readiness and protocol version.
+- `GET /up`, unauthenticated and limited to routing health, protocol version,
+  `write_ready`, and a machine-readable degradation reason.
 
-There is no HTTP endpoint for backup, maintenance, migration, shutdown, file
-download, or arbitrary administration.
+`/up` returns `200` whenever the process can accept and routably answer API
+requests, including while ingestion is disk-degraded or the temporary backup
+gate is closed. Its body reports `write_ready: false` in those states. It returns
+`503` only when the database cannot be opened or the service cannot safely
+resume normal API service. There is no HTTP endpoint for backup, maintenance,
+migration, shutdown, file download, or arbitrary administration.
 
 Tokens contain at least 256 bits of random entropy, are compared in constant
 time, and are never written to request logs. TLS is mandatory for a public URL.
@@ -497,21 +508,34 @@ space, and operating headroom.
 
 Before each write transaction and maintenance operation, the service checks a
 configurable free-space floor that defaults to the greater of 2 GiB or 10% of
-the volume. Below that floor it marks readiness degraded, does not begin new
+the volume. Below that floor it marks the write path degraded, does not begin new
 writes or backups, and returns retryable `507` responses to ingestion; existing
 read queries remain available. An actual out-of-space error rolls back the
 current transaction, removes any incomplete backup, records the error in
-`wide_events_store_status`, and follows the same degraded behavior. `/up`
-returns `503` while degraded so setup and operator checks make the condition
-visible.
+`wide_events_store_status`, and follows the same write-degraded behavior. `/up`
+continues to return `200` with `write_ready: false` and a disk-space reason, so
+Kamal Proxy continues routing read queries. The setup checker treats
+`write_ready: false` as an actionable failure even though routing health is
+successful.
 
 The same maintenance gate creates one automatic local backup per day under
 `/var/lib/wide-events/backups/` and retains the three most recent backups by
-default. A backup drains the writer, checkpoints the database, creates a
-consistent timestamped DuckDB copy through DuckDB's database-copy facility,
-verifies that the copy can be opened and queried, then resumes writes. Clients
-buffer or receive a retryable response while the gate is closed. Query requests
-receive `503` while the exclusive backup operation runs.
+default. Before closing the gate, and again after draining and checkpointing, a
+backup requires free bytes greater than or equal to the database-file size plus
+the larger of 512 MiB or 10% of that size, while also preserving the generic
+free-space floor. If that capacity is unavailable, the automatic backup is
+skipped before copying, an operator-visible error with required and available
+bytes is logged and stored in `wide_events_store_status`, and existing backups
+are left untouched. An on-demand backup returns the same values with a non-zero
+exit status.
+
+Once its capacity preflight passes, backup creates a consistent timestamped
+DuckDB copy through DuckDB's database-copy facility, verifies that the copy can
+be opened and queried, then resumes writes. Clients buffer or receive a
+retryable response while the gate is closed. Query requests receive `503` while
+the exclusive backup operation runs, while `/up` remains `200` with
+`write_ready: false` so the temporary operation does not remove the service from
+routing.
 
 `kamal wide-events-backup` runs the administrative executable in the existing
 accessory container over Kamal's SSH path. The executable asks the already
@@ -579,7 +603,7 @@ so DNS propagation never leaves the setup process hanging indefinitely.
 
 After `kamal setup`, verification:
 
-1. checks `/up` and protocol compatibility;
+1. checks `/up`, protocol compatibility, and `write_ready`;
 2. sends a synthetic event and queries it back;
 3. asks the user to exercise one real Rails route;
 4. queries and displays that captured row; and
@@ -608,6 +632,8 @@ old image and verified backup remain available for rollback instructions.
 - No request-thread network calls.
 - Sender lifecycle across fork and PID change at enqueue time.
 - Service/environment drift warnings and retry-ledger horizon behavior.
+- Loss counters remain pending until acknowledgement and survive discard of the
+  batch that first carried them.
 - Bounded shutdown flush.
 - Query client authentication, formats, timeouts, and errors.
 - Generator idempotence and safe refusal on ambiguous Kamal files.
@@ -626,10 +652,14 @@ old image and verified backup remain available for rollback instructions.
 - External access, extension, configuration, busy, timeout, row, response, and
   memory limits.
 - Retention by `received_at`, checkpointing, backup verification, and pruning.
+- Backup capacity preflight against database-file size, including insufficient
+  capacity before and after the maintenance gate closes.
 - Administrative-socket permissions and proof that the helper never opens the
   database.
-- Low-disk and out-of-space rollback, degraded readiness, and partial-backup
+- Low-disk and out-of-space rollback, write-degraded status, and partial-backup
   cleanup.
+- Disk degradation returns ingestion `507` while `/up` remains `200` with
+  `write_ready: false` and authenticated read queries remain available.
 - Crash recovery from the WAL and failure during pre- and post-commit windows.
 
 ### End to end
@@ -642,6 +672,9 @@ old image and verified backup remain available for rollback instructions.
   never changes the simulated Rails response.
 - The generated Kamal fixture passes `kamal config` on Kamal 2.10.0 and 2.12.0,
   including accessory proxy and healthcheck behavior, and rejects older Kamal.
+  The test asserts that normalized output retains the structured directory's
+  `local`, `remote`, `mode: "0750"`, and `owner: "1000:1000"` values; those keys
+  are the reason for the 2.10.0 floor.
 - Both `amd64` and `arm64` images boot, migrate, ingest, query, and back up.
 
 ## Acceptance Criteria
@@ -668,8 +701,9 @@ The feature is ready for its first release when:
 9. The generated standard Kamal configuration validates and the post-deploy
    synthetic write/read check succeeds.
 10. Existing Wide Events OTel and log deployments remain backward compatible.
-11. Ingestion memory, query concurrency, retry-ledger growth, and disk exhaustion
-    all have tested finite bounds and observable failure behavior.
+11. Ingestion memory, query concurrency, retry-ledger growth, backup capacity,
+    and disk exhaustion all have tested finite bounds and observable failure
+    behavior without unnecessarily removing readable telemetry from routing.
 
 ## Explicit Tradeoffs and Risks
 
