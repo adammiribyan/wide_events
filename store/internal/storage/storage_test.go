@@ -75,6 +75,25 @@ func TestOpenLocksSecurityConfiguration(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestEveryPooledConnectionUsesLockedSecurityConfiguration(t *testing.T) {
+	db := openTestDatabase(t)
+	first, err := db.QueryConnection(context.Background())
+	require.NoError(t, err)
+	defer first.Close()
+	second, err := db.QueryConnection(context.Background())
+	require.NoError(t, err)
+	defer second.Close()
+
+	for _, connection := range []*sql.Conn{first, second} {
+		var externalAccess string
+		require.NoError(t, connection.QueryRowContext(context.Background(),
+			"SELECT current_setting('enable_external_access')::VARCHAR").Scan(&externalAccess))
+		assert.Equal(t, "false", externalAccess)
+		_, err := connection.ExecContext(context.Background(), "SET enable_external_access = true")
+		require.Error(t, err)
+	}
+}
+
 func TestCommitBatchRollsBackLedgerAndEventsOnFailure(t *testing.T) {
 	db := openTestDatabase(t)
 	batch := validBatch("018f6f50-2f9d-7fb0-a258-6d9f95f20c03")

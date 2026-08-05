@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -34,35 +35,46 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 	}
 
 	maxTempSize := strconv.FormatInt(cfg.QueryTempBytes, 10) + "B"
+	var initializeOnce sync.Once
+	var initializeErr error
 	dsn := databasePath + "?storage_compatibility_version=v1.5.0"
 	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
-		statements := []struct {
-			query string
-			args  []driver.NamedValue
-		}{
-			{query: "SET memory_limit = '1GiB'"},
-			{query: "SET temp_directory = ?", args: []driver.NamedValue{{Ordinal: 1, Value: tempDirectory}}},
-			{query: "SET max_temp_directory_size = ?", args: []driver.NamedValue{{Ordinal: 1, Value: maxTempSize}}},
-			{query: "SET enable_external_access = false"},
-			{query: "SET autoinstall_known_extensions = false"},
-			{query: "SET autoload_known_extensions = false"},
-			{query: "SET allow_community_extensions = false"},
-			{query: "SET lock_configuration = true"},
-		}
-		for _, statement := range statements {
-			if _, err := execer.ExecContext(ctx, statement.query, statement.args); err != nil {
-				return fmt.Errorf("initialize DuckDB setting %q: %w", statement.query, err)
+		initializeOnce.Do(func() {
+			statements := []struct {
+				query string
+				args  []driver.NamedValue
+			}{
+				{query: "SET memory_limit = '1GiB'"},
+				{query: "SET temp_directory = ?", args: []driver.NamedValue{{Ordinal: 1, Value: tempDirectory}}},
+				{query: "SET max_temp_directory_size = ?", args: []driver.NamedValue{{Ordinal: 1, Value: maxTempSize}}},
+				{query: "SET enable_external_access = false"},
+				{query: "SET autoinstall_known_extensions = false"},
+				{query: "SET autoload_known_extensions = false"},
+				{query: "SET allow_community_extensions = false"},
+				{query: "SET lock_configuration = true"},
 			}
-		}
-		return nil
+			for _, statement := range statements {
+				if _, err := execer.ExecContext(ctx, statement.query, statement.args); err != nil {
+					initializeErr = fmt.Errorf("initialize DuckDB setting %q: %w", statement.query, err)
+					return
+				}
+			}
+		})
+		return initializeErr
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open DuckDB connector: %w", err)
 	}
 
 	sqlDB := sql.OpenDB(connector)
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
+	queryConnections := cfg.QueryActive
+	if queryConnections <= 0 {
+		queryConnections = 2
+	}
+	// The database remains the sole owner of the pool. Reserve one connection
+	// for ingestion and maintenance in addition to the bounded query workers.
+	sqlDB.SetMaxOpenConns(queryConnections + 1)
+	sqlDB.SetMaxIdleConns(queryConnections + 1)
 	database := &Database{sql: sqlDB, service: cfg.Service, environment: cfg.Environment}
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
@@ -73,6 +85,16 @@ func Open(ctx context.Context, cfg config.Config) (*Database, error) {
 		return nil, err
 	}
 	return database, nil
+}
+
+// QueryConnection lends one owned connection to the bounded query executor.
+// Callers must close it to return it to the database-owned pool.
+func (database *Database) QueryConnection(ctx context.Context) (*sql.Conn, error) {
+	connection, err := database.sql.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("borrow DuckDB query connection: %w", err)
+	}
+	return connection, nil
 }
 
 // Close closes the store's sole DuckDB instance.

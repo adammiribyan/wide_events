@@ -1,4 +1,4 @@
-// Package httpapi exposes the authenticated ingestion and routing-health API.
+// Package httpapi exposes authenticated ingestion, query, and routing-health APIs.
 package httpapi
 
 import (
@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/adammiribyan/wide_events/store/internal/config"
 	"github.com/adammiribyan/wide_events/store/internal/ingest"
 	"github.com/adammiribyan/wide_events/store/internal/protocol"
+	"github.com/adammiribyan/wide_events/store/internal/query"
 	"github.com/adammiribyan/wide_events/store/internal/storage"
 )
 
@@ -25,10 +27,15 @@ type tenancyLoggingConfigurer interface {
 	ConfigureTenancyLogging(*slog.Logger, string, string)
 }
 
+type queryExecutor interface {
+	Execute(context.Context, query.Request, io.Writer) (query.ResultMeta, error)
+}
+
 // Dependencies are the owned process resources used by the HTTP routes.
 type Dependencies struct {
 	Database *storage.Database
 	Writer   submitter
+	Query    queryExecutor
 	Logger   *slog.Logger
 }
 
@@ -36,6 +43,7 @@ type server struct {
 	config   config.Config
 	database *storage.Database
 	writer   submitter
+	queries  queryExecutor
 	decoders chan struct{}
 }
 
@@ -54,14 +62,25 @@ func New(cfg config.Config, dependencies Dependencies) http.Handler {
 	if configurable, ok := dependencies.Writer.(tenancyLoggingConfigurer); ok {
 		configurable.ConfigureTenancyLogging(logger, cfg.Service, cfg.Environment)
 	}
+	queries := dependencies.Query
+	if queries == nil {
+		queries = query.NewExecutor(dependencies.Database, query.Limits{
+			Active:           cfg.QueryActive,
+			Waiting:          cfg.QueryWaiting,
+			WaitTimeout:      cfg.QueryWaitTimeout,
+			ExecutionTimeout: cfg.QueryTimeout,
+		}, logger)
+	}
 	api := &server{
 		config:   cfg,
 		database: dependencies.Database,
 		writer:   dependencies.Writer,
+		queries:  queries,
 		decoders: make(chan struct{}, maxConcurrentDecodes),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", api.ingest)
+	mux.HandleFunc("POST /v1/query", api.query)
 	mux.HandleFunc("GET /up", api.health)
 	return mux
 }

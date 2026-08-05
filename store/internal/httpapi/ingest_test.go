@@ -277,6 +277,7 @@ func testConfig() config.Config {
 		Service:          "checkout",
 		Environment:      "test",
 		IngestToken:      testIngestToken,
+		QueryToken:       testQueryToken,
 		WriterQueueBytes: 32 << 20,
 	}
 }
