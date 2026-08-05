@@ -56,7 +56,7 @@ module WideEvent
       end
 
       def apply
-        preflight!
+        parsed = preflight!
         lines = @original.lines
         changed = false
 
@@ -66,7 +66,7 @@ module WideEvent
         changed |= apply_env_in_place(lines, env_range) if env_range
 
         aliases_range = root_block_range(lines, "aliases")
-        changed |= apply_aliases_in_place(lines, aliases_range) if aliases_range
+        changed |= apply_aliases_in_place(lines, aliases_range, parsed["aliases"] || {}) if aliases_range
 
         accessories_range = root_block_range(lines, "accessories")
         changed |= apply_accessories_in_place(lines, accessories_range) if accessories_range
@@ -164,13 +164,19 @@ module WideEvent
         false
       end
 
+      # Only called once the parsed hash has already confirmed
+      # accessories.wide_events exists. If the line scanner cannot locate it
+      # (an indentation shape it does not understand, for example), that is
+      # a scan failure, not evidence of ownership - treat it as unowned so
+      # preflight refuses instead of silently accepting or replacing a
+      # foreign accessory it never actually verified.
       def owned_accessory?(content)
         lines = content.lines
         range = root_block_range(lines, "accessories")
-        return true unless range
+        return false unless range
 
         child_range = child_block_range(lines, range, "wide_events")
-        return true unless child_range
+        return false unless child_range
 
         start_r, = child_range
         preceding = lines[0...start_r].reverse.find { |l| !l.strip.empty? }
@@ -321,11 +327,16 @@ module WideEvent
 
       # ---- aliases merge ---------------------------------------------------
 
-      def apply_aliases_in_place(lines, range)
-        existing = mapping_keys(lines, range, indent: 2)
+      # Existence is decided from the safely-parsed hash, not a line scan:
+      # a quoted or otherwise unusually-written key (e.g. "telemetry": ...)
+      # still normalizes to the same string key in `aliases`, so relying on
+      # the parsed hash here (rather than the child_key_regex line scan)
+      # keeps an existing user alias from being silently shadowed by a
+      # second, identically-named key that Psych would resolve to ours.
+      def apply_aliases_in_place(lines, range, aliases)
         missing_lines = []
-        missing_lines << ALIAS_TELEMETRY_LINE unless existing.include?(ALIAS_TELEMETRY_KEY)
-        missing_lines << ALIAS_BACKUP_LINE unless existing.include?(ALIAS_BACKUP_KEY)
+        missing_lines << ALIAS_TELEMETRY_LINE unless aliases.key?(ALIAS_TELEMETRY_KEY)
+        missing_lines << ALIAS_BACKUP_LINE unless aliases.key?(ALIAS_BACKUP_KEY)
         return false if missing_lines.empty?
 
         block = [ "  #{BEGIN_MARKER}\n", *missing_lines.map { |l| "  #{l}\n" }, "  #{END_MARKER}\n" ]
@@ -347,21 +358,58 @@ module WideEvent
 
       # ---- accessories.wide_events insertion -------------------------------
 
+      # By the time this runs, preflight has already refused any
+      # accessories.wide_events block this editor did not create (see
+      # #owned_accessory?), so a `child_range` found here is guaranteed to be
+      # our own marker-wrapped block. Re-rendering and replacing that whole
+      # marked region on every apply - rather than leaving it alone once
+      # created - is what makes the BEGIN/END markers useful for
+      # "deterministic updates": a gem upgrade (new pinned image) or a
+      # corrected --host/--hostname/--retention-days on a later
+      # `bin/rails generate wide_events:store` run actually takes effect.
+      # Identical re-renders leave the file byte-for-byte unchanged.
       def apply_accessories_in_place(lines, range)
         child_range = child_block_range(lines, range, "wide_events")
-        return false if child_range
+        return replace_owned_accessory_block(lines, child_range) if child_range
 
         block = [ "  #{BEGIN_MARKER}\n", *indented(wide_events_template_lines, 2), "  #{END_MARKER}\n" ]
         insert_before(lines, content_end(lines, range), block)
         true
       end
 
+      def replace_owned_accessory_block(lines, child_range)
+        start_r, naive_end_r = child_range
+        start_r -= 1 if lines[start_r - 1]&.strip == BEGIN_MARKER
+
+        # child_range's naive end is the next sibling key, or (when
+        # wide_events is the last child) the parent's own end - which can
+        # extend past our own END marker into blank/comment lines that
+        # belong to whatever root section comes next. Search for our own
+        # marker explicitly instead of trusting that boundary, so the
+        # replacement span never reaches past it.
+        marker_idx = ((start_r + 1)...naive_end_r).find { |i| lines[i].strip == END_MARKER }
+        end_r = marker_idx ? marker_idx + 1 : naive_end_r
+
+        new_block = [ "  #{BEGIN_MARKER}\n", *indented(wide_events_template_lines, 2), "  #{END_MARKER}\n" ]
+        return false if lines[start_r...end_r] == new_block
+
+        lines[start_r...end_r] = new_block
+        true
+      end
+
       def append_accessories_section(lines)
+        # Wraps only the wide_events child with markers - not the whole
+        # "accessories:" root key - so ownership detection (which looks for
+        # a marker immediately before the wide_events: line) behaves
+        # identically whether accessories already existed or was created
+        # here for the first time. That consistency is what lets a later
+        # re-apply find and replace this exact block instead of refusing it
+        # as foreign.
         block = [
-          "#{BEGIN_MARKER}\n",
           "accessories:\n",
+          "  #{BEGIN_MARKER}\n",
           *indented(wide_events_template_lines, 2),
-          "#{END_MARKER}\n"
+          "  #{END_MARKER}\n"
         ]
         append_root_block(lines, block)
         true
@@ -409,10 +457,18 @@ module WideEvent
 
       # ---- Post-mutation safety net ----------------------------------------
 
+      # The line-based patcher assumes indentation/style shapes the fixtures
+      # cover; a shape it does not understand (mismatched sequence indents, a
+      # flow-style child value, unusual nesting, ...) can produce invalid
+      # YAML even though preflight raised no Refusal. Catching that here,
+      # after mutation but before returning, converts every such case into
+      # the same "refuse, leave the file untouched, print a snippet" contract
+      # as an explicit preflight refusal, instead of letting a RuntimeError
+      # escape #apply with a half-built Result and no snippet.
       def verify_parseable!(content)
         YAML.safe_load(content, permitted_classes: [], aliases: false)
       rescue Psych::Exception => e
-        raise "wide_events internal error: generated config/deploy.yml is not valid YAML (#{e.message})"
+        raise Refusal, "editing config/deploy.yml would produce invalid YAML (#{e.message}); this shape is not supported"
       end
 
       def apply_minimum_version(lines)

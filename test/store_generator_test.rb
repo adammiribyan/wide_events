@@ -114,4 +114,31 @@ class StoreGeneratorTest < Rails::Generators::TestCase
     assert_match(/--retention-days/, output)
     assert_no_file ".kamal/wide-events-ingest-token"
   end
+
+  test "refuses cleanly instead of crashing when config/deploy.yml is a shape the editor cannot patch" do
+    FileUtils.mkdir_p(File.join(destination_root, "config"))
+    original = "service: my_app\nenv:\n  secret:\n  - RAILS_MASTER_KEY\n"
+    File.write(File.join(destination_root, "config/deploy.yml"), original)
+
+    output = run_generator DEFAULT_ARGS
+
+    assert_match(/wide_events:/, output)
+    assert_equal original, File.read(File.join(destination_root, "config/deploy.yml"))
+    assert_no_file ".kamal/wide-events-ingest-token"
+    assert_no_file ".kamal/secrets"
+  end
+
+  test "updates the pinned image and settings when regenerated after a gem upgrade" do
+    install_deploy_yml("default_deploy.yml")
+    run_generator DEFAULT_ARGS
+    old_content = File.read(File.join(destination_root, "config/deploy.yml"))
+    old_parsed = YAML.safe_load(old_content)
+    assert_equal "203.0.113.20", old_parsed.dig("accessories", "wide_events", "host")
+
+    run_generator %w[--host=198.51.100.9 --hostname=telemetry.example.com --retention-days=90]
+
+    new_parsed = YAML.safe_load(File.read(File.join(destination_root, "config/deploy.yml")))
+    assert_equal "198.51.100.9", new_parsed.dig("accessories", "wide_events", "host")
+    assert_equal 90, new_parsed.dig("accessories", "wide_events", "env", "clear", "WIDE_EVENTS_RETENTION_DAYS")
+  end
 end

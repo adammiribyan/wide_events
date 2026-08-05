@@ -153,4 +153,75 @@ class KamalDeployEditorTest < ActiveSupport::TestCase
     parsed = YAML.safe_load(result.content)
     assert_equal "2.10.0", parsed.fetch("minimum_version")
   end
+
+  # ---- Regression tests for review findings -----------------------------
+
+  test "refuses instead of producing invalid YAML for a block sequence at the key's own indent" do
+    content = "service: my_app\nenv:\n  secret:\n  - RAILS_MASTER_KEY\n"
+    result = editor(content).apply
+    refute result.changed?
+    assert_equal content, result.content
+    assert result.conflicts.any? { |c| c.include?("invalid YAML") }
+  end
+
+  test "refuses instead of producing invalid YAML for an inline flow child value" do
+    content = "service: my_app\nenv:\n  clear: {}\n"
+    result = editor(content).apply
+    refute result.changed?
+    assert_equal content, result.content
+    assert result.conflicts.any? { |c| c.include?("invalid YAML") }
+  end
+
+  test "refuses instead of producing invalid YAML for env.clear children at an unexpected indent" do
+    content = "service: my_app\nenv:\n  clear:\n      RAILS_LOG_LEVEL: info\n"
+    result = editor(content).apply
+    refute result.changed?
+    assert_equal content, result.content
+    assert result.conflicts.any? { |c| c.include?("invalid YAML") }
+  end
+
+  test "refuses a foreign wide_events accessory nested at an indent the line scanner cannot verify" do
+    content = "service: my_app\naccessories:\n    wide_events:\n      image: someone-elses-image:latest\n"
+    result = editor(content).apply
+    refute result.changed?
+    assert_equal content, result.content
+    assert result.conflicts.any? { |c| c.include?("wide_events") }
+  end
+
+  test "does not shadow an existing quoted telemetry alias, but still adds the missing backup alias" do
+    content = "aliases:\n  \"telemetry\": app exec --reuse \"bin/rails my_own_thing\"\n"
+    result = editor(content).apply
+    parsed = YAML.safe_load(result.content)
+    assert_equal 'app exec --reuse "bin/rails my_own_thing"', parsed.dig("aliases", "telemetry")
+    assert_equal 'accessory exec wide_events "wide-events admin backup"', parsed.dig("aliases", "wide-events-backup")
+  end
+
+  test "updates an already-owned accessory block when regenerated with different settings" do
+    first = editor("service: my_app\n", retention_days: 30, image: "ghcr.io/adammiribyan/wide-events-store:0.1.0").apply
+    second = editor(first.content, retention_days: 90,
+      image: "ghcr.io/adammiribyan/wide-events-store:0.2.0").apply
+
+    assert second.changed?
+    parsed = YAML.safe_load(second.content)
+    assert_equal "ghcr.io/adammiribyan/wide-events-store:0.2.0", parsed.dig("accessories", "wide_events", "image")
+    assert_equal 90, parsed.dig("accessories", "wide_events", "env", "clear", "WIDE_EVENTS_RETENTION_DAYS")
+
+    third = editor(second.content, retention_days: 90,
+      image: "ghcr.io/adammiribyan/wide-events-store:0.2.0").apply
+    refute third.changed?
+    assert_equal second.content, third.content
+  end
+
+  test "updating an owned accessory block that already existed alongside other sections preserves them" do
+    first = editor(existing_sections_deploy, retention_days: 30,
+      image: "ghcr.io/adammiribyan/wide-events-store:0.1.0").apply
+    second = editor(first.content, retention_days: 90,
+      image: "ghcr.io/adammiribyan/wide-events-store:0.2.0").apply
+
+    parsed = YAML.safe_load(second.content)
+    assert_equal "ghcr.io/adammiribyan/wide-events-store:0.2.0", parsed.dig("accessories", "wide_events", "image")
+    assert_equal "mysql:8.0", parsed.dig("accessories", "db", "image")
+    assert_equal 'app exec --interactive --reuse "bin/rails console"', parsed.dig("aliases", "console")
+    assert_includes second.content, "# Existing aliases wide_events does not own."
+  end
 end
