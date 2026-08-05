@@ -28,4 +28,5 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "activesupport", ">= 7.1"
   spec.add_dependency "rack", ">= 2.2"
+  spec.add_dependency "csv"
 end

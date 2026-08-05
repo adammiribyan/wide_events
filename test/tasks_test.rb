@@ -3,13 +3,19 @@ require "rake"
 require "tempfile"
 require "tmpdir"
 require "fileutils"
+require "socket"
+require "stringio"
+require "json"
 
 class TasksTest < ActiveSupport::TestCase
+  QUERY_TOKEN = "test-query-token"
+
   def with_rake
     rake = Rake::Application.new
     Rake.application = rake
     Rake::Task.define_task(:environment)
     load File.expand_path("../lib/wide_event/tasks/registry.rake", __dir__)
+    load File.expand_path("../lib/wide_event/tasks/store.rake", __dir__)
     yield rake
   end
 
@@ -80,6 +86,191 @@ class TasksTest < ActiveSupport::TestCase
       refute_includes doc, dir, "the committed doc must not carry a machine-specific path"
     ensure
       ENV.delete("WIDE_EVENTS_DOCS_PATH")
+    end
+  end
+
+  # --- wide_events:sql ---
+
+  test "sql task reads piped SQL and prints CSV" do
+    ENV["WIDE_EVENTS_FORMAT"] = "csv"
+    with_store_server(query_json(columns: [ "count" ], rows: [ [ 3 ] ])) do
+      assert_output("count\n3\n") { invoke_store_task(stdin: StringIO.new("SELECT count(*) AS count FROM wide_events")) }
+    end
+  ensure
+    ENV.delete("WIDE_EVENTS_FORMAT")
+  end
+
+  test "sql task reads piped SQL and prints JSON by request" do
+    ENV["WIDE_EVENTS_FORMAT"] = "json"
+    with_store_server(query_json(columns: [ "count" ], rows: [ [ 3 ] ])) do
+      output = capture_io { invoke_store_task(stdin: StringIO.new("SELECT count(*) AS count FROM wide_events")) }.first
+      assert_equal({ "columns" => [ "count" ], "rows" => [ [ 3 ] ], "truncated" => false }, JSON.parse(output))
+    end
+  ensure
+    ENV.delete("WIDE_EVENTS_FORMAT")
+  end
+
+  test "sql task defaults to a rendered table" do
+    with_store_server(query_json(columns: [ "count" ], rows: [ [ 3 ] ])) do
+      output = capture_io { invoke_store_task(stdin: StringIO.new("SELECT count(*) AS count FROM wide_events")) }.first
+      assert_match(/count/, output)
+      assert_match(/\|\s*3\s*\|/, output)
+    end
+  end
+
+  test "sql task does nothing for blank piped input" do
+    with_store_server(query_json) do |server|
+      capture_io { invoke_store_task(stdin: StringIO.new("   \n  ")) }
+      assert_empty server.requests
+    end
+  end
+
+  test "sql task runs a multiline, semicolon-terminated statement interactively and exits on quit" do
+    with_store_server(query_json(columns: [ "count" ], rows: [ [ 3 ] ])) do
+      readline = FakeReadline.new([ "SELECT count(*)", "FROM wide_events;", "quit" ])
+      out = capture_io do
+        WideEvent::Tasks::Store.run(stdin: StringIO.new(""), stdout: $stdout, readline: readline, interactive: true)
+      end.first
+      assert_match(/count/, out)
+    end
+  end
+
+  test "sql task exits the interactive loop on EOF" do
+    with_store_server(query_json) do
+      readline = FakeReadline.new([]) # readline.readline returns nil immediately, simulating ^D
+      assert_nothing_raised do
+        WideEvent::Tasks::Store.run(stdin: StringIO.new(""), stdout: StringIO.new, readline: readline, interactive: true)
+      end
+    end
+  end
+
+  test "sql task keeps the interactive session open after a rejected query" do
+    with_store_server([ 400, {}, { error: "Bad Request" }.to_json ]) do
+      readline = FakeReadline.new([ "DELETE FROM wide_events;", "quit" ])
+      out = capture_io do
+        WideEvent::Tasks::Store.run(stdin: StringIO.new(""), stdout: $stdout, readline: readline, interactive: true)
+      end.first
+      assert_match(/error:/, out)
+      refute_includes out, QUERY_TOKEN
+    end
+  end
+
+  test "sql task aborts with setup guidance when the store url or query token is missing" do
+    WideEvent.configure { |c| c.store_url = nil; c.store_query_token = nil }
+    error = assert_raises(SystemExit) do
+      capture_io { invoke_store_task(stdin: StringIO.new("SELECT 1")) }
+    end
+    refute error.success?
+  end
+
+  test "sql task aborts on a rejected piped query without leaking the token or a raw server body" do
+    with_store_server([ 400, {}, { error: "Bad Request" }.to_json ]) do
+      error = assert_raises(SystemExit) do
+        capture_io { invoke_store_task(stdin: StringIO.new("DELETE FROM wide_events")) }
+      end
+      refute error.success?
+    end
+  end
+
+  private
+
+  def query_json(columns: [ "value" ], rows: [ [ 1 ] ], truncated: false)
+    { columns: columns, rows: rows, truncated: truncated }.to_json
+  end
+
+  # Configures a real store URL/query token pointing at a one-shot fake
+  # server that returns `response` (a JSON string body, or an
+  # [status, headers, body] triple) for every /v1/query it receives.
+  def with_store_server(response)
+    triple = response.is_a?(String) ? [ 200, {}, response ] : response
+    server = FakeSqlServer.new(triple)
+    WideEvent.configure do |c|
+      c.store_url = "http://127.0.0.1:#{server.port}"
+      c.store_ingest_token = "unused-ingest-token"
+      c.store_query_token = QUERY_TOKEN
+    end
+    yield server
+  ensure
+    server&.close
+  end
+
+  def invoke_store_task(stdin:)
+    original_stdin = $stdin
+    $stdin = stdin
+    with_rake { |rake| rake["wide_events:sql"].invoke }
+  ensure
+    $stdin = original_stdin
+  end
+
+  # readline.readline(prompt, add_history) returning each queued line in
+  # turn, then nil (EOF) once exhausted — stands in for GNU Readline/Reline
+  # without a real terminal.
+  class FakeReadline
+    def initialize(lines)
+      @lines = lines.dup
+    end
+
+    def readline(_prompt, _add_history)
+      @lines.shift
+    end
+  end
+
+  # A minimal raw-socket HTTP responder for POST /v1/query: serves the same
+  # fixed [status, headers, body] response to every connection it accepts,
+  # which is all that's needed here (each test either sends one request,
+  # or several identical ones in the interactive-loop tests).
+  class FakeSqlServer
+    attr_reader :port, :requests
+
+    def initialize(response)
+      @tcp = TCPServer.new("127.0.0.1", 0)
+      @port = @tcp.local_address.ip_port
+      @response = response
+      @requests = Queue.new
+      @handlers = []
+      @thread = Thread.new { serve }
+    end
+
+    def close
+      @tcp.close
+      @thread.kill
+      @handlers.each(&:kill)
+    end
+
+    private
+
+    def serve
+      loop do
+        socket = @tcp.accept
+        @handlers << Thread.new { handle(socket) }
+      end
+    rescue IOError, Errno::EBADF
+      nil
+    end
+
+    def handle(socket)
+      request_line = socket.gets
+      return if request_line.nil?
+      headers = {}
+      while (line = socket.gets) && !line.strip.empty?
+        key, value = line.split(":", 2)
+        headers[key.strip.downcase] = value.strip if key && value
+      end
+      length = headers["content-length"].to_i
+      body = length > 0 ? socket.read(length) : ""
+      @requests << { headers: headers, body: body }
+
+      status, extra_headers, response_body = @response
+      header_lines = { "Content-Type" => "application/json", "Content-Length" => response_body.bytesize.to_s, "Connection" => "close" }
+      header_lines.merge!(extra_headers || {})
+      socket.write("HTTP/1.1 #{status} Status\r\n")
+      header_lines.each { |key, value| socket.write("#{key}: #{value}\r\n") }
+      socket.write("\r\n")
+      socket.write(response_body)
+    rescue IOError, Errno::EPIPE, Errno::ECONNRESET
+      nil
+    ensure
+      socket.close rescue nil
     end
   end
 end
