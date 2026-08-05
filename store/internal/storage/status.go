@@ -75,6 +75,19 @@ func (database *Database) AddRejectedBatches(ctx context.Context, count uint64) 
 	return nil
 }
 
+// AddTenancyMismatches adds newly observed client/store tenancy drift to the
+// lifetime counter without exposing the store's SQL handle.
+func (database *Database) AddTenancyMismatches(ctx context.Context, count uint64) error {
+	if _, err := database.sql.ExecContext(ctx, `
+		UPDATE wide_events_store_state
+		SET tenancy_mismatches = tenancy_mismatches + ?::UBIGINT
+		WHERE singleton
+	`, strconv.FormatUint(count, 10)); err != nil {
+		return fmt.Errorf("update tenancy mismatch total: %w", err)
+	}
+	return nil
+}
+
 // SetWriteReady publishes whether writes may be admitted and why not.
 func (database *Database) SetWriteReady(ctx context.Context, ready bool, reason string) error {
 	if ready {
@@ -88,6 +101,19 @@ func (database *Database) SetWriteReady(ctx context.Context, ready bool, reason 
 		return fmt.Errorf("update write readiness: %w", err)
 	}
 	return nil
+}
+
+// WriteStatus reads only the one-row admission state. It avoids the aggregate
+// operational view on request and routing-health hot paths.
+func (database *Database) WriteStatus(ctx context.Context) (ready bool, reason string, err error) {
+	if err := database.sql.QueryRowContext(ctx, `
+		SELECT write_ready, degradation_reason
+		FROM wide_events_store_state
+		WHERE singleton
+	`).Scan(&ready, &reason); err != nil {
+		return false, "", fmt.Errorf("read write status: %w", err)
+	}
+	return ready, reason, nil
 }
 
 // RecordRetention publishes a retention result. A successful result advances
