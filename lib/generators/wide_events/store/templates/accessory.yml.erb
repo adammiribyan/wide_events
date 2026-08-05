@@ -1,0 +1,33 @@
+wide_events:
+  image: <%= image %>
+  host: <%= host %>
+
+  proxy:
+    host: <%= hostname %>
+    ssl: true
+    app_port: 7421
+    healthcheck:
+      path: /up
+      interval: 3
+      timeout: 3
+
+  env:
+    clear:
+      WIDE_EVENTS_LISTEN: 0.0.0.0:7421
+      WIDE_EVENTS_DATABASE: /var/lib/wide-events/events.duckdb
+      WIDE_EVENTS_SERVICE: <%= service %>
+      WIDE_EVENTS_ENVIRONMENT: <%= environment %>
+      WIDE_EVENTS_RETENTION_DAYS: <%= retention_days %>
+    secret:
+      - WIDE_EVENTS_INGEST_TOKEN
+      - WIDE_EVENTS_QUERY_TOKEN
+
+  directories:
+    - local: <%= local_directory %>
+      remote: /var/lib/wide-events
+      mode: "0750"
+      owner: "1000:1000"
+
+  options:
+    cpus: 2
+    memory: 2g

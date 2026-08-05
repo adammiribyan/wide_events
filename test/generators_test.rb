@@ -3,6 +3,7 @@ require "rails/generators"
 require "rails/generators/test_case"
 require "generators/wide_events/install/install_generator"
 require "generators/wide_events/skills/skills_generator"
+require "generators/wide_events/store/store_generator"
 
 class InstallGeneratorTest < Rails::Generators::TestCase
   tests WideEvents::Generators::InstallGenerator
@@ -67,5 +68,12 @@ class SkillsGeneratorTest < Rails::Generators::TestCase
     run_generator
     assert_file ".claude/skills/instrumenting-wide-events/SKILL.md", /^---\nname: instrumenting-wide-events/
     assert_file ".claude/skills/debugging-with-wide-events/SKILL.md", /^---\nname: debugging-with-wide-events/
+  end
+end
+
+class StoreGeneratorIsRegisteredTest < ActiveSupport::TestCase
+  test "the store generator is discoverable under the wide_events namespace" do
+    assert_equal WideEvents::Generators::StoreGenerator,
+      Rails::Generators.find_by_namespace("wide_events:store")
   end
 end

@@ -1,0 +1,21 @@
+service: my_app
+image: my-user/my_app
+
+servers:
+  web:
+    - 192.168.0.1
+
+proxy:
+  ssl: true
+  host: app.example.com
+
+# This app already sets WIDE_EVENTS_SERVICE to something wide_events did not
+# choose; the editor must refuse rather than silently overriding it.
+env:
+  clear:
+    WIDE_EVENTS_SERVICE: some-other-service-name
+  secret:
+    - RAILS_MASTER_KEY
+
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
