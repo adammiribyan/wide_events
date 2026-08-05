@@ -99,4 +99,18 @@ class MiddlewareTest < ActiveSupport::TestCase
     assert_equal 1, sink.events.length
     assert_equal true, sink.events.first["main"]
   end
+
+  test "middleware records total duration before flushing" do
+    sink = WideEvent::Sinks::Memory.new
+    WideEvent.configure { |c| c.sink = sink }
+    call_middleware(->(_env) { [ 200, {}, [ "ok" ] ] })
+    assert_operator sink.events.first["duration_ms"], :>=, 0.0
+  end
+
+  test "duration is still recorded when the app raises" do
+    sink = WideEvent::Sinks::Memory.new
+    WideEvent.configure { |c| c.sink = sink }
+    assert_raises(RuntimeError) { call_middleware(->(_env) { raise "kaput" }) }
+    assert_operator sink.events.first["duration_ms"], :>=, 0.0
+  end
 end

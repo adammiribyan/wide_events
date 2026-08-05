@@ -21,6 +21,7 @@ module WideEvent
 
       WideEvent.with do |attrs|
         seed(env)
+        start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
           status, headers, body = @app.call(env)
           ex = env["action_dispatch.exception"]
@@ -48,6 +49,7 @@ module WideEvent
           # and mutates env in place, so the id doesn't exist at seed time
           # but does by the time any outcome unwinds back to here.
           WideEvent.set("http.request.id" => env["action_dispatch.request_id"] || env["HTTP_X_REQUEST_ID"])
+          WideEvent.set("duration_ms" => ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start) * 1000.0).round(2))
           WideEvent.flush(attrs)
         end
       end

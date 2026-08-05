@@ -11,6 +11,11 @@ error:
   set_by: wide_events
   pii: none
   notes: Status >= 500, an unhandled exception, or an error! call.
+duration_ms:
+  type: float
+  set_by: wide_events
+  pii: none
+  notes: Total wall-clock duration of the whole request or job execution, monotonic clock.
 uptime_sec:
   type: integer
   set_by: wide_events
