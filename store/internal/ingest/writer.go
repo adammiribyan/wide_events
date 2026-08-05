@@ -63,6 +63,8 @@ type Writer struct {
 	telemetryWake    chan struct{}
 	telemetryDone    chan struct{}
 	telemetryErr     error
+	telemetryContext context.Context
+	telemetryCancel  context.CancelFunc
 
 	tenancyLogger       *slog.Logger
 	expectedService     string
@@ -75,13 +77,16 @@ func NewWriter(database *storage.Database, maxBytes int64) *Writer {
 }
 
 func newWriter(database database, maxBytes int64) *Writer {
+	telemetryContext, telemetryCancel := context.WithCancel(context.Background())
 	writer := &Writer{
-		database:      database,
-		maxBytes:      maxBytes,
-		wake:          make(chan struct{}, 1),
-		done:          make(chan struct{}),
-		telemetryWake: make(chan struct{}, 1),
-		telemetryDone: make(chan struct{}),
+		database:         database,
+		maxBytes:         maxBytes,
+		wake:             make(chan struct{}, 1),
+		done:             make(chan struct{}),
+		telemetryWake:    make(chan struct{}, 1),
+		telemetryDone:    make(chan struct{}),
+		telemetryContext: telemetryContext,
+		telemetryCancel:  telemetryCancel,
 	}
 	go writer.run()
 	go writer.publishTelemetry()
@@ -160,16 +165,22 @@ func (writer *Writer) Close(ctx context.Context) error {
 
 	select {
 	case <-writer.done:
-		select {
-		case <-writer.telemetryDone:
-			writer.mutex.Lock()
-			err := writer.telemetryErr
-			writer.mutex.Unlock()
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	case <-ctx.Done():
+		writer.telemetryCancel()
+		<-writer.telemetryDone
+		return ctx.Err()
+	}
+
+	select {
+	case <-writer.telemetryDone:
+		writer.telemetryCancel()
+		writer.mutex.Lock()
+		err := writer.telemetryErr
+		writer.mutex.Unlock()
+		return err
+	case <-ctx.Done():
+		writer.telemetryCancel()
+		<-writer.telemetryDone
 		return ctx.Err()
 	}
 }
@@ -235,7 +246,12 @@ func (writer *Writer) publishTelemetry() {
 	defer close(writer.telemetryDone)
 	retryDelay := telemetryRetryMinimum
 	for {
-		<-writer.telemetryWake
+		select {
+		case <-writer.telemetryWake:
+		case <-writer.telemetryContext.Done():
+			writer.setTelemetryError(writer.telemetryContext.Err())
+			return
+		}
 		for {
 			writer.mutex.Lock()
 			version := writer.telemetryVersion
@@ -244,10 +260,10 @@ func (writer *Writer) publishTelemetry() {
 			closing := writer.telemetryClosing
 			writer.mutex.Unlock()
 
-			queueErr := writer.database.SetQueuedIngestBytes(context.Background(), queuedBytes)
+			queueErr := writer.database.SetQueuedIngestBytes(writer.telemetryContext, queuedBytes)
 			var rejectedErr error
 			if rejected > 0 {
-				rejectedErr = writer.database.AddRejectedBatches(context.Background(), rejected)
+				rejectedErr = writer.database.AddRejectedBatches(writer.telemetryContext, rejected)
 			}
 			publishErr := errors.Join(queueErr, rejectedErr)
 
@@ -257,9 +273,6 @@ func (writer *Writer) publishTelemetry() {
 			}
 			changed := writer.telemetryVersion != version
 			closing = closing || writer.telemetryClosing
-			if publishErr != nil && closing {
-				writer.telemetryErr = fmt.Errorf("flush ingest telemetry: %w", publishErr)
-			}
 			writer.mutex.Unlock()
 
 			if publishErr == nil {
@@ -272,7 +285,8 @@ func (writer *Writer) publishTelemetry() {
 				}
 				continue
 			}
-			if closing {
+			if writer.telemetryContext.Err() != nil {
+				writer.setTelemetryError(writer.telemetryContext.Err())
 				return
 			}
 
@@ -283,6 +297,12 @@ func (writer *Writer) publishTelemetry() {
 				if !timer.Stop() {
 					<-timer.C
 				}
+			case <-writer.telemetryContext.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				writer.setTelemetryError(writer.telemetryContext.Err())
+				return
 			}
 			if retryDelay < telemetryRetryMaximum/2 {
 				retryDelay *= 2
@@ -291,6 +311,12 @@ func (writer *Writer) publishTelemetry() {
 			}
 		}
 	}
+}
+
+func (writer *Writer) setTelemetryError(err error) {
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+	writer.telemetryErr = fmt.Errorf("flush ingest telemetry: %w", err)
 }
 
 func (writer *Writer) signalTelemetry() {

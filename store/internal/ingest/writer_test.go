@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -220,14 +222,55 @@ func TestTelemetryRetriesTransientFailuresWithoutAnotherAdmission(t *testing.T) 
 	}, time.Second, time.Millisecond)
 }
 
-func TestCloseReportsPermanentTelemetryFlushFailure(t *testing.T) {
+func TestCloseRetriesTransientFinalTelemetryFailure(t *testing.T) {
+	database := &flakyTelemetryDatabase{queueFailures: 1}
+	writer := newWriter(database, 1024)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	require.NoError(t, writer.Close(ctx))
+	database.mutex.Lock()
+	defer database.mutex.Unlock()
+	assert.GreaterOrEqual(t, database.queueCalls, 2)
+	assert.Equal(t, []int64{0}, database.queued)
+}
+
+func TestCloseDeadlineStopsPermanentTelemetryRetries(t *testing.T) {
 	batch, canonical := validBatch(t)
 	database := &flakyTelemetryDatabase{queueFailures: 1000, rejectionFailures: 1000}
 	writer := newWriter(database, int64(len(canonical)-1))
 
 	_, err := writer.Submit(context.Background(), batch, canonical)
 	assert.ErrorIs(t, err, ErrQueueFull)
-	assert.Error(t, writer.Close(context.Background()))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	assert.ErrorIs(t, writer.Close(ctx), context.DeadlineExceeded)
+}
+
+func TestCloseCancelsAndJoinsInFlightTelemetryCall(t *testing.T) {
+	database := newContextBlockingTelemetryDatabase()
+	writer := newWriter(database, 1024)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- writer.Close(ctx) }()
+	<-database.started
+
+	err := <-result
+	finishedBeforeReturn := false
+	select {
+	case <-database.finished:
+		finishedBeforeReturn = true
+	default:
+		database.releaseOnce.Do(func() { close(database.release) })
+		<-database.finished
+	}
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, finishedBeforeReturn, "Close returned before the telemetry call terminated")
+	assert.Zero(t, database.active.Load())
+	callsAtReturn := database.calls.Load()
+	runtime.Gosched()
+	assert.Equal(t, callsAtReturn, database.calls.Load(), "telemetry accessed storage after Close returned")
 }
 
 func openTestDatabase(t *testing.T) *storage.Database {
@@ -395,6 +438,7 @@ type flakyTelemetryDatabase struct {
 	rejectionFailures int
 	queued            []int64
 	rejected          uint64
+	queueCalls        int
 }
 
 func (database *flakyTelemetryDatabase) CommitBatch(context.Context, protocol.Batch) (storage.CommitResult, error) {
@@ -404,11 +448,52 @@ func (database *flakyTelemetryDatabase) CommitBatch(context.Context, protocol.Ba
 func (database *flakyTelemetryDatabase) SetQueuedIngestBytes(_ context.Context, queued int64) error {
 	database.mutex.Lock()
 	defer database.mutex.Unlock()
+	database.queueCalls++
 	if database.queueFailures > 0 {
 		database.queueFailures--
 		return errors.New("transient queue telemetry failure")
 	}
 	database.queued = append(database.queued, queued)
+	return nil
+}
+
+type contextBlockingTelemetryDatabase struct {
+	started     chan struct{}
+	finished    chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	finishOnce  sync.Once
+	releaseOnce sync.Once
+	calls       atomic.Int32
+	active      atomic.Int32
+}
+
+func newContextBlockingTelemetryDatabase() *contextBlockingTelemetryDatabase {
+	return &contextBlockingTelemetryDatabase{
+		started:  make(chan struct{}),
+		finished: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+}
+
+func (database *contextBlockingTelemetryDatabase) CommitBatch(context.Context, protocol.Batch) (storage.CommitResult, error) {
+	return storage.CommitResult{}, nil
+}
+
+func (database *contextBlockingTelemetryDatabase) SetQueuedIngestBytes(ctx context.Context, _ int64) error {
+	database.calls.Add(1)
+	database.active.Add(1)
+	database.startedOnce.Do(func() { close(database.started) })
+	select {
+	case <-ctx.Done():
+	case <-database.release:
+	}
+	database.active.Add(-1)
+	database.finishOnce.Do(func() { close(database.finished) })
+	return ctx.Err()
+}
+
+func (database *contextBlockingTelemetryDatabase) AddRejectedBatches(context.Context, uint64) error {
 	return nil
 }
 
