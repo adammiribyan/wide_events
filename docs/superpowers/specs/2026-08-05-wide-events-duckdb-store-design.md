@@ -261,6 +261,7 @@ compatibility error before accepting unsupported payloads.
   "service": "myapp",
   "environment": "production",
   "dropped_events_since_last_batch": 0,
+  "loss_report_id": null,
   "events": [
     {
       "id": "uuid",
@@ -305,15 +306,17 @@ retained for seven days and pruned daily, leaving a safety margin beyond the
 maximum retry horizon while bounding ledger growth.
 
 The sender includes its accumulated loss count in
-`dropped_events_since_last_batch`. The store increments the operational total
-only when it commits a previously unseen `batch_id`, so a retry cannot double
-count it. The sender snapshots, but does not decrement, its pending loss counter
-when sealing a batch. A successful acknowledgement subtracts only that snapshot;
-losses accumulated while the batch was in flight remain pending. If the carrying
-batch is discarded after a permanent failure or the 24-hour retry horizon, its
-snapshot remains pending and is carried by the next batch. A process that never
-reconnects or exits before a later acknowledgement cannot report its final
-losses, which is an accepted limitation of the memory-only v1 sender.
+`dropped_events_since_last_batch`. A non-zero report has its own
+`loss_report_id`; the store records that identifier in a seven-day loss ledger
+and increments the operational total only once, even if the report is re-carried
+by a new batch. The sender snapshots, but does not decrement, its pending loss
+counter when sealing a batch. A successful acknowledgement subtracts only that
+snapshot; losses accumulated while the batch was in flight remain pending. If
+the carrying batch is discarded after a permanent failure or the 24-hour retry
+horizon, its snapshot and `loss_report_id` remain pending and are carried by the
+next batch. A process that never reconnects or exits before a later
+acknowledgement cannot report its final losses, which is an accepted limitation
+of the memory-only v1 sender.
 
 ## Delivery and Backpressure
 
@@ -461,9 +464,11 @@ parser and service overhead. An admission that would cross either bound receives
 
 The query API accepts exactly one statement. The store asks DuckDB for the
 prepared statement type and permits only non-mutating query forms equivalent to
-`SELECT`, read-only `WITH`, `EXPLAIN`, `SHOW`, and `DESCRIBE`. It rejects `COPY`,
-`ATTACH`, `INSTALL`, `LOAD`, `SET`, `PRAGMA`, DDL, DML, multi-statements, and any
-statement whose type cannot be proven read-only.
+`SELECT`, read-only `WITH`, `SHOW`, and `DESCRIBE`. Remote `EXPLAIN` is rejected
+in v1 because DuckDB classifies `EXPLAIN ANALYZE DELETE ...` as `EXPLAIN`, so
+statement type alone cannot prove the inner operation is read-only. The policy
+also rejects `COPY`, `ATTACH`, `INSTALL`, `LOAD`, `SET`, `PRAGMA`, DDL, DML,
+multi-statements, and any statement whose type cannot be proven read-only.
 
 All query connections share these locked startup settings:
 
@@ -646,6 +651,8 @@ old image and verified backup remain available for rollback instructions.
 - Atomic batch validation and insert.
 - Retry deduplication through the batch ledger.
 - Seven-day batch-ledger pruning after the 24-hour client retry horizon.
+- Loss-report deduplication when a discarded batch's pending count is
+  re-carried under a new batch ID, plus seven-day loss-ledger pruning.
 - Promotion of common fields and preservation of typed custom attributes.
 - The documented `variant_extract` query corpus against DuckDB 1.5.5 exactly.
 - Query statement classification and a corpus of bypass attempts.
