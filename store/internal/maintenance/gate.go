@@ -64,18 +64,32 @@ func (gate *gate) closeAll(ctx context.Context) error {
 }
 
 func (gate *gate) closeAndDrain(ctx context.Context, queries bool) error {
+	gate.startClose(queries)
+	if err := gate.drain(ctx, queries); err != nil {
+		gate.open()
+		return err
+	}
+	return nil
+}
+
+func (gate *gate) startClose(queries bool) {
 	gate.mutex.Lock()
 	gate.writesClosed = true
 	if queries {
 		gate.queriesClosed = true
 	}
+	gate.notifyLocked()
+	gate.mutex.Unlock()
+}
+
+func (gate *gate) drain(ctx context.Context, queries bool) error {
+	gate.mutex.Lock()
 	for gate.writes > 0 || queries && gate.queries > 0 {
 		changed := gate.changed
 		gate.mutex.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			gate.open()
 			return ctx.Err()
 		}
 		gate.mutex.Lock()

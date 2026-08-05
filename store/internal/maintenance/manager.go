@@ -89,6 +89,7 @@ type Manager struct {
 	done      chan struct{}
 	startOnce sync.Once
 	closeOnce sync.Once
+	readiness sync.Mutex
 
 	mutex           sync.Mutex
 	lastDaily       string
@@ -98,6 +99,8 @@ type Manager struct {
 	schedulerCancel context.CancelFunc
 	started         bool
 	closed          bool
+	maintenanceOpen bool
+	pendingDiskLow  bool
 }
 
 // NewManager constructs a manager and installs admission callbacks on the
@@ -140,6 +143,8 @@ func NewManager(dependencies Dependencies) *Manager {
 // AdmitWrite enters normal writer admission and performs the binding capacity
 // probe before ownership transfers to the writer.
 func (manager *Manager) AdmitWrite(ctx context.Context) (func(), error) {
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
 	release, err := manager.gate.admitWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -168,6 +173,8 @@ func (manager *Manager) RecoverWrite(parent context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
 	release, err := manager.gate.admitWrite(ctx)
 	if err != nil {
 		return err
@@ -189,6 +196,12 @@ func (manager *Manager) AdmitQuery(ctx context.Context) (func(), error) {
 // HandleNoSpace publishes an actual database I/O exhaustion as the same typed
 // disk degradation used by the preflight.
 func (manager *Manager) HandleNoSpace(ctx context.Context, _ error) {
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
+	if manager.maintenanceOpen {
+		manager.pendingDiskLow = true
+		return
+	}
 	_ = manager.database.SetWriteReady(ctx, false, "disk_space_low")
 }
 
@@ -280,20 +293,16 @@ func (manager *Manager) runRetention(parent context.Context) (result error) {
 		return err
 	}
 	if assessment.genericLow() {
-		if err := manager.database.SetWriteReady(ctx, false, "disk_space_low"); err != nil {
+		if err := manager.setWriteState(ctx, false, "disk_space_low"); err != nil {
 			return err
 		}
 		return &DiskSpaceError{RequiredBytes: assessment.floor, AvailableBytes: assessment.space.Free}
 	}
-	if err := manager.database.SetWriteReady(ctx, false, "maintenance"); err != nil {
+	if err := manager.beginMaintenance(ctx, false); err != nil {
 		return err
 	}
-	if err := manager.gate.closeWrites(ctx); err != nil {
-		return errors.Join(err, manager.setWriteReady(true, ""))
-	}
 	defer func() {
-		manager.gate.open()
-		result = errors.Join(result, manager.setWriteReady(true, ""))
+		result = errors.Join(result, manager.finishMaintenance(false))
 	}()
 
 	retentionDays := manager.config.RetentionDays
@@ -330,25 +339,17 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 		if assessment.genericLow() {
 			ready, reason = false, "disk_space_low"
 		}
-		if readinessErr := manager.database.SetWriteReady(ctx, ready, reason); readinessErr != nil {
+		if readinessErr := manager.setWriteState(ctx, ready, reason); readinessErr != nil {
 			return errors.Join(err, readinessErr)
 		}
 		return err
 	}
-	if err := manager.database.SetWriteReady(ctx, false, "maintenance"); err != nil {
+	if err := manager.beginMaintenance(ctx, true); err != nil {
 		return err
-	}
-	if err := manager.gate.closeAll(ctx); err != nil {
-		return errors.Join(err, manager.setWriteReady(true, ""))
 	}
 	diskLow := false
 	defer func() {
-		manager.gate.open()
-		ready, reason := true, ""
-		if diskLow {
-			ready, reason = false, "disk_space_low"
-		}
-		result = errors.Join(result, manager.setWriteReady(ready, reason))
+		result = errors.Join(result, manager.finishMaintenance(diskLow))
 	}()
 
 	if err := manager.database.Checkpoint(ctx); err != nil {
@@ -373,25 +374,27 @@ func (manager *Manager) Backup(parent context.Context) (result error) {
 	if err != nil {
 		return err
 	}
-	published := false
-	defer func() {
-		if !published {
-			_ = os.Remove(candidatePath)
-		}
-	}()
 	if err := manager.database.CreateBackup(ctx, candidatePath); err != nil {
 		return err
 	}
-	if err := manager.secureAndSyncCandidate(candidatePath); err != nil {
+	candidate, err := openCandidateObject(manager.backupDir, candidatePath)
+	if err != nil {
 		return err
 	}
+	defer candidate.Close()
+	published := false
+	defer func() {
+		if !published {
+			_ = candidate.removeOwned()
+		}
+	}()
 	if err := manager.database.VerifyBackup(ctx, candidatePath); err != nil {
 		return err
 	}
-	if err := manager.validateCandidate(candidatePath); err != nil {
+	if err := candidate.revalidate("after verification"); err != nil {
 		return err
 	}
-	if err := manager.publishCandidate(candidatePath, finalPath); err != nil {
+	if err := candidate.publish(filepath.Base(finalPath)); err != nil {
 		return err
 	}
 	published = true
@@ -461,6 +464,46 @@ func (manager *Manager) applyWriteCapacity(ctx context.Context, assessment capac
 	return manager.database.SetWriteReady(ctx, true, "")
 }
 
+// Lock order for readiness transitions is always readiness -> gate. Closing
+// is marked while both are held, but draining happens after readiness is
+// released so admitted writer callbacks can finish without inversion.
+func (manager *Manager) beginMaintenance(ctx context.Context, queries bool) error {
+	manager.readiness.Lock()
+	manager.gate.startClose(queries)
+	if err := manager.database.SetWriteReady(ctx, false, "maintenance"); err != nil {
+		manager.gate.open()
+		manager.readiness.Unlock()
+		return err
+	}
+	manager.maintenanceOpen = true
+	manager.readiness.Unlock()
+	if err := manager.gate.drain(ctx, queries); err != nil {
+		return errors.Join(err, manager.finishMaintenance(false))
+	}
+	return nil
+}
+
+func (manager *Manager) finishMaintenance(diskLow bool) error {
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
+	diskLow = diskLow || manager.pendingDiskLow
+	ready, reason := true, ""
+	if diskLow {
+		ready, reason = false, "disk_space_low"
+	}
+	err := manager.setWriteReady(ready, reason)
+	manager.maintenanceOpen = false
+	manager.pendingDiskLow = false
+	manager.gate.open()
+	return err
+}
+
+func (manager *Manager) setWriteState(ctx context.Context, ready bool, reason string) error {
+	manager.readiness.Lock()
+	defer manager.readiness.Unlock()
+	return manager.database.SetWriteReady(ctx, ready, reason)
+}
+
 func (manager *Manager) prepareBackupDirectory() error {
 	databaseParent, err := filepath.Abs(filepath.Dir(manager.config.Database))
 	if err != nil {
@@ -479,7 +522,7 @@ func (manager *Manager) prepareBackupDirectory() error {
 	}
 	directory = filepath.Join(resolvedParent, filepath.Base(directory))
 	manager.backupDir = directory
-	if err := validateNoSymlinkChain(resolvedParent); err != nil {
+	if err := validateTrustedAncestors(resolvedParent); err != nil {
 		return err
 	}
 	if err := os.Mkdir(directory, 0o700); err != nil && !os.IsExist(err) {
@@ -506,7 +549,7 @@ func (manager *Manager) validateBackupDirectory() error {
 	return nil
 }
 
-func validateNoSymlinkChain(path string) error {
+func validateTrustedAncestors(path string) error {
 	volume := filepath.VolumeName(path)
 	remainder := strings.TrimPrefix(path, volume)
 	current := volume + string(os.PathSeparator)
@@ -521,6 +564,29 @@ func validateNoSymlinkChain(path string) error {
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("backup ancestor %q must not be a symlink", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("backup ancestor %q must be a directory", current)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("inspect backup ancestor %q ownership", current)
+		}
+		owner := int(stat.Uid)
+		permissions := info.Mode().Perm()
+		writableByOthers := permissions&0o022 != 0
+		switch {
+		case owner == os.Geteuid():
+			if writableByOthers {
+				return fmt.Errorf("backup ancestor %q is a writable ancestor (group or other)", current)
+			}
+		case owner == 0:
+			rootStickyTemporary := info.Mode()&os.ModeSticky != 0 && permissions == 0o777
+			if writableByOthers && !rootStickyTemporary {
+				return fmt.Errorf("backup ancestor %q is a writable ancestor without the root-owned sticky exception", current)
+			}
+		default:
+			return fmt.Errorf("backup ancestor %q is owned by untrusted uid %d", current, owner)
 		}
 	}
 	return nil
@@ -567,77 +633,6 @@ func (manager *Manager) nextCandidatePath() (string, error) {
 	return "", fmt.Errorf("no unused backup candidate name available")
 }
 
-func (manager *Manager) validateCandidate(path string) error {
-	if filepath.Dir(path) != manager.backupDir || !strings.HasPrefix(filepath.Base(path), ".wide-events-backup-") || !strings.HasSuffix(path, ".partial") {
-		return fmt.Errorf("invalid generated backup candidate path")
-	}
-	if err := manager.validateBackupDirectory(); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("inspect backup candidate: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("backup candidate must be a regular file")
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("backup candidate must be owned by uid %d", os.Geteuid())
-	}
-	return nil
-}
-
-func (manager *Manager) secureAndSyncCandidate(path string) error {
-	if err := manager.validateCandidate(path); err != nil {
-		return err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("set backup candidate mode: %w", err)
-	}
-	before, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("inspect backup candidate before sync: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return fmt.Errorf("open backup candidate for sync: %w", err)
-	}
-	defer file.Close()
-	after, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("inspect opened backup candidate: %w", err)
-	}
-	if !os.SameFile(before, after) || !after.Mode().IsRegular() {
-		return fmt.Errorf("backup candidate changed during validation")
-	}
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync backup candidate: %w", err)
-	}
-	return nil
-}
-
-func (manager *Manager) publishCandidate(candidate, final string) error {
-	if err := manager.validateCandidate(candidate); err != nil {
-		return err
-	}
-	if err := manager.validateBackupDirectory(); err != nil {
-		return err
-	}
-	if filepath.Dir(final) != manager.backupDir {
-		return fmt.Errorf("backup final path escaped trusted directory")
-	}
-	if _, err := os.Lstat(final); err == nil {
-		return fmt.Errorf("backup final path already exists")
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("inspect backup final path: %w", err)
-	}
-	if err := os.Rename(candidate, final); err != nil {
-		return fmt.Errorf("publish verified backup: %w", err)
-	}
-	return nil
-}
-
 func (manager *Manager) pruneBackups(ctx context.Context, current string) error {
 	if err := manager.validateBackupDirectory(); err != nil {
 		return err
@@ -647,7 +642,7 @@ func (manager *Manager) pruneBackups(ctx context.Context, current string) error 
 		return fmt.Errorf("list backups: %w", err)
 	}
 	type backupFile struct {
-		path     string
+		object   *backupObject
 		name     string
 		modified time.Time
 	}
@@ -656,25 +651,36 @@ func (manager *Manager) pruneBackups(ctx context.Context, current string) error 
 		if entry.Type()&os.ModeSymlink != 0 || !strings.HasPrefix(entry.Name(), "wide-events-") || !strings.HasSuffix(entry.Name(), ".duckdb") {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return fmt.Errorf("inspect backup %q: %w", entry.Name(), err)
-		}
 		path := filepath.Join(manager.backupDir, entry.Name())
-		if info.Mode().IsRegular() {
-			if path != current {
-				verifyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-				verifyErr := manager.database.VerifyBackup(verifyContext, path)
-				cancel()
-				if verifyErr != nil {
-					continue
-				}
-			}
-			backups = append(backups, backupFile{
-				path: path, name: entry.Name(), modified: info.ModTime(),
-			})
+		object, err := openExistingBackupObject(manager.backupDir, path)
+		if err != nil {
+			continue
 		}
+		if path != current {
+			verifyContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+			verifyErr := manager.database.VerifyBackup(verifyContext, path)
+			cancel()
+			if verifyErr != nil {
+				_ = object.Close()
+				continue
+			}
+		}
+		if err := object.revalidate("after verification"); err != nil {
+			_ = object.Close()
+			continue
+		}
+		info, err := object.file.Stat()
+		if err != nil {
+			_ = object.Close()
+			return fmt.Errorf("inspect verified backup %q: %w", entry.Name(), err)
+		}
+		backups = append(backups, backupFile{object: object, name: entry.Name(), modified: info.ModTime()})
 	}
+	defer func() {
+		for _, backup := range backups {
+			_ = backup.object.Close()
+		}
+	}()
 	sort.Slice(backups, func(left, right int) bool {
 		if backups[left].modified.Equal(backups[right].modified) {
 			return backups[left].name < backups[right].name
@@ -684,8 +690,14 @@ func (manager *Manager) pruneBackups(ctx context.Context, current string) error 
 	for len(backups) > 3 {
 		oldest := backups[0]
 		backups = backups[1:]
-		if err := os.Remove(oldest.path); err != nil {
-			return fmt.Errorf("remove expired backup: %w", err)
+		removeErr := oldest.object.removeOwned()
+		closeErr := oldest.object.Close()
+		if errors.Is(removeErr, errBackupObjectChanged) {
+			continue
+		} else if removeErr != nil {
+			return fmt.Errorf("remove expired backup: %w", removeErr)
+		} else if closeErr != nil {
+			return fmt.Errorf("close expired backup: %w", closeErr)
 		}
 	}
 	return syncDirectory(manager.backupDir)
