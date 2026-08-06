@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 (2026-08-06)
+
+- Fix the store image pin in the README. The v0.2.0 release rewrite turned
+  `ghcr.io/adammiribyan/wide-events-store:0.2.0` into `.2.0`.
+
 ## v0.2.0 (2026-08-06)
 
 - **A bundled telemetry store.** `bin/rails generate wide_events:store
