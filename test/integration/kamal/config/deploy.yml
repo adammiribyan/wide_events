@@ -46,7 +46,7 @@ aliases:
   logs: app logs -f
   # BEGIN wide_events store
   telemetry: app exec -i --reuse "bin/rails wide_events:sql"
-  wide-events-backup: accessory exec wide_events "wide-events admin backup"
+  wide-events-backup: accessory exec wide_events --reuse "wide-events admin backup"
   # END wide_events store
 
 # Use a persistent storage volume for local files.

@@ -28,7 +28,14 @@ module WideEvent
       ALIAS_TELEMETRY_KEY = "telemetry"
       ALIAS_TELEMETRY_LINE = 'telemetry: app exec -i --reuse "bin/rails wide_events:sql"'
       ALIAS_BACKUP_KEY = "wide-events-backup"
-      ALIAS_BACKUP_LINE = 'wide-events-backup: accessory exec wide_events "wide-events admin backup"'
+      # --reuse is load-bearing: without it Kamal's `accessory exec` starts a
+      # *new* container from the store image, where (a) the image entrypoint
+      # already is /usr/local/bin/wide-events, so the appended command becomes
+      # argv[0] and main exits 2 with usage, and (b) there is no running
+      # server holding /run/wide-events/admin.sock to take the backup through.
+      # With --reuse this is a `docker exec` into the live accessory container,
+      # which is the only place an on-demand backup can be requested.
+      ALIAS_BACKUP_LINE = 'wide-events-backup: accessory exec wide_events --reuse "wide-events admin backup"'
 
       ACCESSORY_TEMPLATE_PATH = File.expand_path(
         "../../generators/wide_events/store/templates/accessory.yml.erb", __dir__

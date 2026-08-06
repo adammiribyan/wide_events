@@ -102,10 +102,12 @@ Exactly three things, nothing else:
 - **DNS timeouts are resumable.** If `wide_events:setup:check` reports
   `needs_dns`, that is normal while waiting on propagation, not a failure -
   running the exact same command again later continues correctly.
-- **Backups are local-only.** The accessory takes automatic daily local
-  backups (kept three most recent) via the `wide-events-backup` alias; this
-  protects against logical mistakes and bad upgrades, not loss of the VM or
-  volume itself. There is no off-host backup in v1.
+- **Backups are local-only.** The store itself takes a verified local backup
+  once a day in-process (three most recent kept, in `backups/` next to the
+  database); `kamal wide-events-backup` is the on-demand version of the same
+  thing and prints the path it wrote. Either way this protects against
+  logical mistakes and bad upgrades, not loss of the VM or volume itself.
+  There is no off-host backup in v1.
 - **Query access uses a separate token from ingestion.** `.kamal/wide-events-
   query-token` is read-only and distinct from `.kamal/wide-events-ingest-
   token`; sharing query access (e.g. with a teammate or another agent) never

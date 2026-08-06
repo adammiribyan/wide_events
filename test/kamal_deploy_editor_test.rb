@@ -66,8 +66,26 @@ class KamalDeployEditorTest < ActiveSupport::TestCase
     result = editor(default_deploy).apply
     parsed = YAML.safe_load(result.content)
     assert_equal 'app exec -i --reuse "bin/rails wide_events:sql"', parsed.dig("aliases", "telemetry")
-    assert_equal 'accessory exec wide_events "wide-events admin backup"', parsed.dig("aliases", "wide-events-backup")
+    assert_equal 'accessory exec wide_events --reuse "wide-events admin backup"', parsed.dig("aliases", "wide-events-backup")
     assert_equal 'app exec --interactive --reuse "bin/rails console"', parsed.dig("aliases", "console")
+  end
+
+  # A config that parses is not a command that works. Without --reuse, Kamal's
+  # `accessory exec` runs `docker run --rm ... <image> wide-events admin
+  # backup` in a fresh container: the image entrypoint is already the
+  # wide-events binary (so the appended command lands in argv[0] and main
+  # exits 2 with usage), and that container has no running server holding
+  # /run/wide-events/admin.sock. Both alias commands must therefore exec into
+  # an already-running container.
+  test "both generated aliases exec into a running container rather than starting a new one" do
+    result = editor(default_deploy).apply
+    aliases = YAML.safe_load(result.content).fetch("aliases")
+
+    [ "telemetry", "wide-events-backup" ].each do |name|
+      command = aliases.fetch(name)
+      assert_includes command, "--reuse", "the #{name} alias must reuse the running container"
+    end
+    assert_match(/\Aaccessory exec wide_events --reuse /, aliases.fetch("wide-events-backup"))
   end
 
   test "pins the exact store image" do
@@ -193,7 +211,7 @@ class KamalDeployEditorTest < ActiveSupport::TestCase
     result = editor(content).apply
     parsed = YAML.safe_load(result.content)
     assert_equal 'app exec --reuse "bin/rails my_own_thing"', parsed.dig("aliases", "telemetry")
-    assert_equal 'accessory exec wide_events "wide-events admin backup"', parsed.dig("aliases", "wide-events-backup")
+    assert_equal 'accessory exec wide_events --reuse "wide-events admin backup"', parsed.dig("aliases", "wide-events-backup")
   end
 
   test "updates an already-owned accessory block when regenerated with different settings" do
