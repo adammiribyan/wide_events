@@ -1,0 +1,199 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Kamal compatibility gate for the generated wide_events accessory.
+#
+#   script/test-kamal-config <kamal-version> <success|failure>
+#
+# Installs the requested Kamal into an isolated GEM_HOME (nothing touches
+# this repo's bundle), runs `VERSION=test kamal config` against
+# test/integration/kamal, and asserts the resolved configuration still
+# carries the pieces the store depends on - most importantly the *structured*
+# directory object, whose `mode` and `owner` are what make the mounted DuckDB
+# volume writable by the image's uid/gid 1000.
+#
+# `failure` inverts the gate: Kamal releases older than the accessory's
+# minimum_version must reject this configuration rather than silently drop
+# the fields they do not understand. CI runs 2.10.0 and 2.12.0 as `success`
+# and 2.9.0 as `failure`.
+
+require "fileutils"
+require "open3"
+require "tmpdir"
+require "yaml"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift(File.join(ROOT, "lib"))
+require "wide_event/version"
+require "wide_event/kamal/deploy_editor"
+
+FIXTURE = File.join(ROOT, "test/integration/kamal")
+IMAGE = "ghcr.io/adammiribyan/wide-events-store:#{WideEvent::VERSION}"
+
+def die(message)
+  warn "test-kamal-config: #{message}"
+  exit 1
+end
+
+def report(message)
+  puts "test-kamal-config: #{message}"
+end
+
+version, expectation = ARGV
+die("usage: script/test-kamal-config <kamal-version> <success|failure>") unless version && expectation
+die("expectation must be 'success' or 'failure', got #{expectation.inspect}") unless %w[success failure].include?(expectation)
+
+# --- Isolated Kamal ---------------------------------------------------------
+
+gem_home = File.join(ROOT, "tmp/kamal-gems", version)
+kamal = File.join(gem_home, "bin/kamal")
+unless File.executable?(kamal)
+  FileUtils.mkdir_p(gem_home)
+  report "installing kamal #{version} into #{gem_home}"
+  output, status = Open3.capture2e("gem", "install", "kamal", "-v", version, "-i", gem_home, "--no-document")
+  die("gem install kamal -v #{version} failed:\n#{output}") unless status.success?
+end
+
+# --- Working copy of the fixture -------------------------------------------
+
+Dir.mktmpdir("kamal-config-") do |workdir|
+  FileUtils.cp_r(File.join(FIXTURE, "."), workdir)
+  deploy_path = File.join(workdir, "config/deploy.yml")
+
+  # The committed fixture pins whatever version generated it. Re-pin it to the
+  # working tree's VERSION so this gate never fails on a stale fixture, then
+  # prove the result is byte-identical to what the generator produces today:
+  # DeployEditor rewrites its own marked accessory block on every apply, so an
+  # unchanged re-apply means the fixture really is current generator output.
+  original = File.read(deploy_path)
+  repinned = original.sub(/^(\s*image: )ghcr\.io\/adammiribyan\/wide-events-store:.*$/) { "#{$1}#{IMAGE}" }
+  die("fixture does not pin a wide-events-store image") if repinned == original && !original.include?(IMAGE)
+  File.write(deploy_path, repinned)
+
+  reapplied = WideEvent::Kamal::DeployEditor.new(
+    repinned,
+    service: "myapp",
+    host: "203.0.113.20",
+    hostname: "telemetry.example.com",
+    environment: "production",
+    retention_days: 30
+  ).apply
+  die("re-applying the generator to the fixture refused: #{reapplied.conflicts.inspect}") if reapplied.conflicts.any?
+  if reapplied.content != repinned
+    die("test/integration/kamal/config/deploy.yml is not current generator output; regenerate it")
+  end
+
+  # --- kamal config -----------------------------------------------------------
+
+  env = { "GEM_HOME" => gem_home, "GEM_PATH" => gem_home, "VERSION" => "test" }
+  output, status = Open3.capture2e(env, kamal, "config", chdir: workdir)
+
+  if expectation == "failure"
+    if status.success?
+      die("kamal #{version} accepted a configuration it must reject:\n#{output}")
+    end
+    unless output.include?("directories") || output.downcase.include?("minimum_version")
+      die("kamal #{version} failed for an unrelated reason:\n#{output}")
+    end
+    report "kamal #{version} rejected the accessory as expected"
+    next
+  end
+
+  die("kamal #{version} config failed:\n#{output}") unless status.success?
+
+  # --- Assertions on the resolved configuration -------------------------------
+  #
+  # Both a structural check (Kamal's own YAML, so nothing depends on how it
+  # chooses to quote scalars) and a normalized textual check of the exact
+  # directory block the store's volume permissions depend on.
+
+  config = begin
+    YAML.safe_load(output, permitted_symbols: [], symbolize_names: false, aliases: true, permitted_classes: [ Symbol ])
+  rescue Psych::Exception => e
+    die("kamal #{version} config output is not parseable YAML (#{e.message}):\n#{output}")
+  end
+
+  accessory = config.dig(:accessories, "wide_events") || config.dig("accessories", "wide_events")
+  die("kamal #{version} config has no wide_events accessory:\n#{output}") unless accessory
+
+  expected_accessory = {
+    "image" => IMAGE,
+    "host" => "203.0.113.20",
+    "proxy" => {
+      "host" => "telemetry.example.com",
+      "ssl" => true,
+      "app_port" => 7421,
+      "healthcheck" => { "path" => "/up", "interval" => 3, "timeout" => 3 }
+    },
+    "directories" => [ {
+      "local" => "/var/lib/myapp-wide-events",
+      "remote" => "/var/lib/wide-events",
+      "mode" => "0750",
+      "owner" => "1000:1000"
+    } ]
+  }
+  expected_accessory.each do |key, expected|
+    actual = accessory[key]
+    die("kamal #{version} resolved accessory #{key} as #{actual.inspect}, expected #{expected.inspect}") unless actual == expected
+  end
+
+  clear = accessory.dig("env", "clear") || {}
+  {
+    "WIDE_EVENTS_LISTEN" => "0.0.0.0:7421",
+    "WIDE_EVENTS_DATABASE" => "/var/lib/wide-events/events.duckdb",
+    "WIDE_EVENTS_SERVICE" => "myapp",
+    "WIDE_EVENTS_ENVIRONMENT" => "production",
+    "WIDE_EVENTS_RETENTION_DAYS" => 30
+  }.each do |key, expected|
+    die("kamal #{version} resolved #{key} as #{clear[key].inspect}, expected #{expected.inspect}") unless clear[key] == expected
+  end
+  secret = accessory.dig("env", "secret") || []
+  %w[WIDE_EVENTS_INGEST_TOKEN WIDE_EVENTS_QUERY_TOKEN].each do |key|
+    die("kamal #{version} dropped the #{key} secret binding") unless secret.include?(key)
+  end
+
+  # --- Alias command semantics ------------------------------------------------
+  #
+  # A config that parses is not a command that works, and `kamal config` does
+  # not resolve aliases, so this checks the two halves separately: that the
+  # aliases Kamal just accepted carry --reuse, and that this Kamal release
+  # actually understands --reuse on `accessory exec`.
+  #
+  # Without it, `accessory exec` is `docker run --rm` on a *new* container:
+  # the store image's entrypoint is already /usr/local/bin/wide-events, so the
+  # appended command becomes argv[0] and main exits 2 with usage, and that
+  # container has no running server holding /run/wide-events/admin.sock. Both
+  # generated aliases must therefore exec into the live container.
+
+  aliases = YAML.safe_load(File.read(deploy_path)).fetch("aliases", {})
+  {
+    "telemetry" => "bin/rails wide_events:sql",
+    "wide-events-backup" => "wide-events admin backup"
+  }.each do |name, command|
+    defined_as = aliases[name]
+    die("the fixture kamal #{version} accepted has no #{name} alias") unless defined_as
+    die("the #{name} alias is #{defined_as.inspect}, which does not run #{command.inspect}") unless defined_as.include?(command)
+    die("the #{name} alias is #{defined_as.inspect}, which starts a new container instead of reusing the running one (missing --reuse)") unless defined_as.include?("--reuse")
+  end
+
+  %w[accessory app].each do |subcommand|
+    help, help_status = Open3.capture2e(env, kamal, subcommand, "exec", "--help", chdir: workdir)
+    die("kamal #{version} #{subcommand} exec --help failed:\n#{help}") unless help_status.success?
+    die("kamal #{version} does not support --reuse on `#{subcommand} exec`:\n#{help}") unless help.include?("--reuse")
+  end
+
+  # The exact block from the plan, quote-normalized: Kamal renders string
+  # scalars with whichever quoting style it prefers, and that must not be
+  # allowed to hide a dropped or retyped field.
+  normalized = output.gsub('"', "").lines.map { |line| line.sub(/^\s*-?\s*/, "").rstrip }
+  expected_block = [
+    "local: /var/lib/myapp-wide-events",
+    "remote: /var/lib/wide-events",
+    "mode: '0750'",
+    "owner: 1000:1000"
+  ]
+  start = normalized.each_index.find { |i| normalized[i, expected_block.length] == expected_block }
+  die("kamal #{version} did not preserve the structured directory object:\n#{output}") unless start
+
+  report "kamal #{version} preserved the structured directory, proxy, healthcheck, and env bindings"
+end

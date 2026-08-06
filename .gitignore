@@ -2,5 +2,7 @@
 /pkg/
 /tmp/
 /test/tmp/
+/.worktrees/
 /gemfiles/*.gemfile.lock
 *.gem
+/store/wide-events

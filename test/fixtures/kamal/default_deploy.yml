@@ -1,0 +1,45 @@
+# Name of your application. Used to uniquely configure containers.
+service: my_app
+
+# Name of the container image.
+image: my-user/my_app
+
+# Deploy to these servers.
+servers:
+  web:
+    - 192.168.0.1
+
+# Enable SSL auto certification via Let's Encrypt.
+proxy:
+  ssl: true
+  host: app.example.com
+
+# Credentials for your image host.
+registry:
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# Inject ENV variables into containers (secrets come from .kamal/secrets).
+env:
+  secret:
+    - RAILS_MASTER_KEY
+
+# Aliases are triggered with "bin/kamal <alias>".
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
+  shell: app exec --interactive --reuse "bash"
+  logs: app logs -f
+
+# Use a persistent storage volume for local files.
+volumes:
+  - "my_app_storage:/rails/storage"
+
+# Configure the image builder.
+builder:
+  arch: amd64
+
+# Uncomment to add an accessory later.
+# accessories:
+#   db:
+#     image: mysql:8.0
+#     host: 192.168.0.2

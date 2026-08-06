@@ -1,0 +1,74 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Packaging gate: builds the gem and asserts the resulting .gem actually
+# contains every file the store path needs at runtime. The gemspec globs
+# `{lib,skills}/**/*`, so a new directory is only shipped if it lands under
+# one of those - easy to get wrong, and invisible until someone installs the
+# published gem. This checks the built artifact's own file list, not the
+# gemspec's intent.
+
+require "fileutils"
+require "open3"
+require "rubygems/package"
+
+ROOT = File.expand_path("..", __dir__)
+Dir.chdir(ROOT)
+
+REQUIRED = [
+  "lib/wide_events.rb",
+  "lib/wide_event.rb",
+  "lib/wide_event/version.rb",
+  "lib/wide_event/configuration.rb",
+  "lib/wide_event/store/client.rb",
+  "lib/wide_event/store/envelope.rb",
+  "lib/wide_event/store/formatter.rb",
+  "lib/wide_event/store/query_result.rb",
+  "lib/wide_event/store/sender.rb",
+  "lib/wide_event/sinks/store.rb",
+  "lib/wide_event/kamal/deploy_editor.rb",
+  "lib/wide_event/kamal/secrets_editor.rb",
+  "lib/wide_event/setup/checker.rb",
+  "lib/wide_event/setup/command_runner.rb",
+  "lib/wide_event/tasks/store.rake",
+  "lib/wide_event/tasks/setup.rake",
+  "lib/wide_event/tasks/registry.rake",
+  "lib/generators/wide_events/store/store_generator.rb",
+  "lib/generators/wide_events/store/templates/accessory.yml.erb",
+  "lib/generators/wide_events/skills/skills_generator.rb",
+  "skills/instrumenting-wide-events/SKILL.md",
+  "skills/debugging-with-wide-events/SKILL.md",
+  "skills/setting-up-wide-events-store/SKILL.md",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE.txt"
+].freeze
+
+def die(message)
+  warn "check-gem-contents: #{message}"
+  exit 1
+end
+
+output, status = Open3.capture2e("gem", "build", "wide_events.gemspec")
+die("gem build failed:\n#{output}") unless status.success?
+puts output
+
+built = Dir["wide_events-*.gem"].max_by { |path| File.mtime(path) }
+die("gem build produced no .gem file") unless built
+
+files = Gem::Package.new(built).spec.files
+missing = REQUIRED.reject { |path| files.include?(path) }
+
+# Skill directory names have changed once already; enumerate what is on disk
+# so a newly added skill is caught even if REQUIRED was not updated.
+on_disk_skills = Dir["skills/*/SKILL.md"].sort
+die("no skills found on disk - the gemspec glob has nothing to package") if on_disk_skills.empty?
+missing.concat(on_disk_skills.reject { |path| files.include?(path) })
+
+FileUtils.rm_f(built)
+
+unless missing.empty?
+  die("the built gem is missing:\n  #{missing.uniq.sort.join("\n  ")}")
+end
+
+puts "check-gem-contents: #{files.length} files packaged, including #{on_disk_skills.length} skills"

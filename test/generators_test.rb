@@ -3,6 +3,7 @@ require "rails/generators"
 require "rails/generators/test_case"
 require "generators/wide_events/install/install_generator"
 require "generators/wide_events/skills/skills_generator"
+require "generators/wide_events/store/store_generator"
 
 class InstallGeneratorTest < Rails::Generators::TestCase
   tests WideEvents::Generators::InstallGenerator
@@ -18,6 +19,34 @@ class InstallGeneratorTest < Rails::Generators::TestCase
   test "creates AGENTS.md with the wide-events section when absent" do
     run_generator
     assert_file "AGENTS.md", /wide event/i
+  end
+
+  test "running the generator twice does not duplicate the AGENTS.md section" do
+    run_generator
+    once = File.read(File.join(destination_root, "AGENTS.md"))
+
+    run_generator
+
+    twice = File.read(File.join(destination_root, "AGENTS.md"))
+    assert_equal once, twice
+    assert_equal 1, twice.scan("## Wide events").size
+  end
+
+  test "installs all three agent skills" do
+    run_generator
+    assert_file ".claude/skills/instrumenting-wide-events/SKILL.md", /^---\nname: instrumenting-wide-events/
+    assert_file ".claude/skills/debugging-with-wide-events/SKILL.md", /^---\nname: debugging-with-wide-events/
+    assert_file ".claude/skills/setting-up-wide-events-store/SKILL.md", /^---\nname: setting-up-wide-events-store/
+  end
+
+  test "running the generator twice leaves skill files unchanged" do
+    run_generator
+    before = File.read(File.join(destination_root, ".claude/skills/setting-up-wide-events-store/SKILL.md"))
+
+    run_generator
+
+    after = File.read(File.join(destination_root, ".claude/skills/setting-up-wide-events-store/SKILL.md"))
+    assert_equal before, after
   end
 
   DEFAULT_TEST_HELPER = <<~RUBY
@@ -63,9 +92,24 @@ class SkillsGeneratorTest < Rails::Generators::TestCase
   destination File.expand_path("../tmp/generators", __dir__)
   setup :prepare_destination
 
-  test "installs both agent skills" do
+  test "installs all three agent skills" do
     run_generator
     assert_file ".claude/skills/instrumenting-wide-events/SKILL.md", /^---\nname: instrumenting-wide-events/
     assert_file ".claude/skills/debugging-with-wide-events/SKILL.md", /^---\nname: debugging-with-wide-events/
+    assert_file ".claude/skills/setting-up-wide-events-store/SKILL.md", /^---\nname: setting-up-wide-events-store/
+  end
+
+  test "running the generator twice updates skill files in place without leaving stray copies" do
+    run_generator
+    run_generator
+    assert_equal %w[debugging-with-wide-events instrumenting-wide-events setting-up-wide-events-store],
+      Dir.children(File.join(destination_root, ".claude/skills")).sort
+  end
+end
+
+class StoreGeneratorIsRegisteredTest < ActiveSupport::TestCase
+  test "the store generator is discoverable under the wide_events namespace" do
+    assert_equal WideEvents::Generators::StoreGenerator,
+      Rails::Generators.find_by_namespace("wide_events:store")
   end
 end

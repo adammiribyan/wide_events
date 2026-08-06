@@ -1,8 +1,11 @@
 require "rails/generators/base"
+require "generators/wide_events/skill_installer"
 
 module WideEvents
   module Generators
     class InstallGenerator < Rails::Generators::Base
+      include WideEvents::Generators::SkillInstaller
+
       source_root File.expand_path("templates", __dir__)
 
       def create_initializer
@@ -13,10 +16,21 @@ module WideEvents
         copy_file "registry.yml", "config/wide_event/registry.yml"
       end
 
+      def install_skills
+        copy_wide_events_skills
+      end
+
+      # Idempotent: a second run of this generator must not duplicate the
+      # section in an AGENTS.md it already added it to.
       def add_agents_section
         section = File.read(File.expand_path("templates/agents_md_section.md", __dir__))
-        if File.exist?(File.join(destination_root, "AGENTS.md"))
-          append_to_file "AGENTS.md", "\n#{section}"
+        path = File.join(destination_root, "AGENTS.md")
+        if File.exist?(path)
+          if File.read(path).include?(section.strip)
+            say_status :identical, "AGENTS.md"
+          else
+            append_to_file "AGENTS.md", "\n#{section}"
+          end
         else
           create_file "AGENTS.md", section
         end

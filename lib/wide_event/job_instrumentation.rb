@@ -33,6 +33,7 @@ module WideEvent
           "job.queue_latency_ms" => enqueued ? ((Time.now - enqueued) * 1000).round : nil,
           "job.scheduled" => wide_event_scheduled?
         }.merge(WideEvent.uptime_attributes))
+        start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
           block.call
         rescue Exception => e
@@ -40,6 +41,7 @@ module WideEvent
                         "exception.message" => e.message.to_s[0, 500])
           raise
         ensure
+          WideEvent.set("duration_ms" => ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start) * 1000.0).round(2))
           WideEvent.flush(attrs)
         end
       end

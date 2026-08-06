@@ -1,0 +1,40 @@
+# Already has a minimum_version higher than what wide_events requires; that
+# value must never be lowered.
+minimum_version: 2.12.0
+
+service: my_app
+image: my-user/my_app
+
+servers:
+  web:
+    - 192.168.0.1
+
+proxy:
+  ssl: true
+  host: app.example.com
+
+registry:
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# App environment already has unrelated clear and secret entries.
+env:
+  clear:
+    RAILS_LOG_LEVEL: info
+  secret:
+    - RAILS_MASTER_KEY
+
+# An unrelated accessory already exists; wide_events must add its own
+# accessory alongside it without disturbing this one.
+accessories:
+  db:
+    image: mysql:8.0
+    host: 192.168.0.2
+    env:
+      clear:
+        MYSQL_DATABASE: my_app
+
+# Existing aliases wide_events does not own.
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
+  shell: app exec --interactive --reuse "bash"

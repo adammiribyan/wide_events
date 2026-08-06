@@ -6,12 +6,14 @@ Gem::Specification.new do |spec|
   spec.authors = [ "Adam Miribyan" ]
   spec.email = [ "adam@adam.am" ]
 
-  spec.summary = "One wide telemetry event per request or job, on the OTel span you already export."
+  spec.summary = "One wide telemetry event per Rails request or job, in a database you own."
   spec.description = "Collects everything a Rails app knows about each request or job execution " \
                      "into one flat, high-cardinality event: route, user, build, query counts, " \
-                     "cache hits, feature flags, phase timings, errors. Flushes onto the OpenTelemetry " \
-                     "root span or a JSON log line. Ships a checkable attribute registry, test helpers, " \
-                     "and agent skills for writing and querying instrumentation."
+                     "cache hits, feature flags, phase timings, errors. Ships a bundled DuckDB store " \
+                     "you deploy as a Kamal accessory (one generator, then SQL against production), " \
+                     "or flushes onto the OpenTelemetry root span or a JSON log line instead. " \
+                     "Includes a checkable attribute registry, test helpers, and agent skills for " \
+                     "instrumenting, querying, and deploying."
   spec.homepage = "https://github.com/adammiribyan/wide_events"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2"
@@ -28,4 +30,5 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "activesupport", ">= 7.1"
   spec.add_dependency "rack", ">= 2.2"
+  spec.add_dependency "csv"
 end

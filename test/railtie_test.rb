@@ -82,6 +82,34 @@ class RailtieTest < ActiveSupport::TestCase
     OpenTelemetry.tracer_provider = previous
   end
 
+  SHUTDOWN_BOOT_SCRIPT = <<~RUBY
+    require "rails"
+    require "wide_events"
+
+    def WideEvent.shutdown!(timeout: 2.0)
+      puts "SHUTDOWN CALLED"
+    end
+
+    class Dummy < Rails::Application
+      config.eager_load = false
+      config.logger = Logger.new(nil)
+      config.secret_key_base = "test"
+    end
+    Dummy.initialize!
+    puts "BOOT OK"
+  RUBY
+
+  test "railtie registers WideEvent.shutdown! with at_exit" do
+    output, status = Open3.capture2e(
+      { "OTEL_EXPORTER_OTLP_ENDPOINT" => nil },
+      "bundle", "exec", "ruby", "-e", SHUTDOWN_BOOT_SCRIPT,
+      chdir: File.expand_path("..", __dir__)
+    )
+    assert status.success?, output
+    assert_includes output, "BOOT OK"
+    assert_includes output, "SHUTDOWN CALLED"
+  end
+
   test "install! skips span processor registration for non-otel sinks" do
     WideEvent.configure { |c| c.sink = :log }
     previous = OpenTelemetry.tracer_provider

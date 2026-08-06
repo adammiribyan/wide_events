@@ -1,0 +1,6 @@
+*
+!store/
+!store/**/
+!store/**/*.go
+!store/go.mod
+!store/go.sum

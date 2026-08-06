@@ -1,0 +1,403 @@
+// Package ingest serializes bounded, acknowledged batch commits.
+package ingest
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/adammiribyan/wide_events/store/internal/protocol"
+	"github.com/adammiribyan/wide_events/store/internal/storage"
+	duckdb "github.com/duckdb/duckdb-go/v2"
+)
+
+var (
+	ErrQueueFull           = errors.New("ingest writer queue is full")
+	ErrInvalidCanonical    = errors.New("canonical batch bytes must not be empty")
+	ErrInsufficientStorage = errors.New("insufficient storage for ingest commit")
+	ErrClosed              = errors.New("ingest writer is closed")
+)
+
+const (
+	telemetryRetryMinimum = 10 * time.Millisecond
+	telemetryRetryMaximum = time.Second
+)
+
+type commitResponse struct {
+	result storage.CommitResult
+	err    error
+}
+
+type submission struct {
+	batch     protocol.Batch
+	canonical []byte
+	response  chan commitResponse
+	release   func()
+}
+
+type database interface {
+	CommitBatch(context.Context, protocol.Batch) (storage.CommitResult, error)
+	SetQueuedIngestBytes(context.Context, int64) error
+	AddRejectedBatches(context.Context, uint64) error
+}
+
+// Writer admits canonical batches under a byte budget and commits them in one
+// dedicated goroutine. Admitted bytes remain charged until CommitBatch returns.
+type Writer struct {
+	database database
+	maxBytes int64
+
+	mutex         sync.Mutex
+	queue         []*submission
+	queuedBytes   int64
+	closed        bool
+	wake          chan struct{}
+	done          chan struct{}
+	admissionHook func(context.Context) (func(), error)
+	noSpaceHook   func(context.Context, error)
+
+	telemetryVersion uint64
+	pendingRejected  uint64
+	telemetryClosing bool
+	telemetryWake    chan struct{}
+	telemetryDone    chan struct{}
+	telemetryErr     error
+	telemetryContext context.Context
+	telemetryCancel  context.CancelFunc
+
+	tenancyLogger       *slog.Logger
+	expectedService     string
+	expectedEnvironment string
+}
+
+// NewWriter starts one database writer with a canonical-byte admission limit.
+func NewWriter(database *storage.Database, maxBytes int64) *Writer {
+	return newWriter(database, maxBytes)
+}
+
+func newWriter(database database, maxBytes int64) *Writer {
+	telemetryContext, telemetryCancel := context.WithCancel(context.Background())
+	writer := &Writer{
+		database:         database,
+		maxBytes:         maxBytes,
+		wake:             make(chan struct{}, 1),
+		done:             make(chan struct{}),
+		telemetryWake:    make(chan struct{}, 1),
+		telemetryDone:    make(chan struct{}),
+		telemetryContext: telemetryContext,
+		telemetryCancel:  telemetryCancel,
+	}
+	go writer.run()
+	go writer.publishTelemetry()
+	return writer
+}
+
+// ConfigureTenancyLogging installs the process logger and configured tenancy
+// used by the commit-owned first-commit drift warning.
+func (writer *Writer) ConfigureTenancyLogging(logger *slog.Logger, service, environment string) {
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+	writer.tenancyLogger = logger
+	writer.expectedService = service
+	writer.expectedEnvironment = environment
+}
+
+// SetAdmissionHook installs the maintenance/disk admission hook. The returned
+// release remains owned by the writer until an admitted commit completes.
+func (writer *Writer) SetAdmissionHook(hook func(context.Context) (func(), error)) {
+	writer.mutex.Lock()
+	writer.admissionHook = hook
+	writer.mutex.Unlock()
+}
+
+// SetNoSpaceHook publishes actual engine/OS exhaustion through maintenance.
+func (writer *Writer) SetNoSpaceHook(hook func(context.Context, error)) {
+	writer.mutex.Lock()
+	writer.noSpaceHook = hook
+	writer.mutex.Unlock()
+}
+
+// Submit admits one validated batch and waits for its commit result. Request
+// cancellation stops the wait, but already admitted work remains owned by the
+// writer and completes without spawning another goroutine.
+func (writer *Writer) Submit(ctx context.Context, batch protocol.Batch, canonical []byte) (storage.CommitResult, error) {
+	if len(canonical) == 0 {
+		return storage.CommitResult{}, ErrInvalidCanonical
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.CommitResult{}, err
+	}
+
+	writer.mutex.Lock()
+	hook := writer.admissionHook
+	writer.mutex.Unlock()
+	release := func() {}
+	if hook != nil {
+		var err error
+		release, err = hook(ctx)
+		if err != nil {
+			if isInsufficientStorage(err) {
+				return storage.CommitResult{}, fmt.Errorf("%w: %v", ErrInsufficientStorage, err)
+			}
+			return storage.CommitResult{}, err
+		}
+		if release == nil {
+			release = func() {}
+		}
+	}
+
+	item := &submission{
+		batch:     batch,
+		canonical: canonical,
+		response:  make(chan commitResponse, 1),
+		release:   release,
+	}
+	charge := int64(len(canonical))
+
+	writer.mutex.Lock()
+	if writer.closed {
+		writer.mutex.Unlock()
+		release()
+		return storage.CommitResult{}, ErrClosed
+	}
+	if writer.maxBytes <= 0 || charge > writer.maxBytes || writer.queuedBytes > writer.maxBytes-charge {
+		writer.pendingRejected++
+		writer.telemetryVersion++
+		writer.mutex.Unlock()
+		release()
+		writer.signalTelemetry()
+		return storage.CommitResult{}, ErrQueueFull
+	}
+	writer.queue = append(writer.queue, item)
+	writer.queuedBytes += charge
+	writer.telemetryVersion++
+	writer.mutex.Unlock()
+	writer.signalTelemetry()
+
+	select {
+	case writer.wake <- struct{}{}:
+	default:
+	}
+
+	select {
+	case response := <-item.response:
+		return response.result, response.err
+	case <-ctx.Done():
+		return storage.CommitResult{}, ctx.Err()
+	}
+}
+
+// Close stops new admissions, drains all accepted work, and waits for the
+// single writer goroutine within ctx's deadline.
+func (writer *Writer) Close(ctx context.Context) error {
+	writer.mutex.Lock()
+	writer.closed = true
+	writer.mutex.Unlock()
+	select {
+	case writer.wake <- struct{}{}:
+	default:
+	}
+
+	select {
+	case <-writer.done:
+	case <-ctx.Done():
+		writer.telemetryCancel()
+		<-writer.telemetryDone
+		return ctx.Err()
+	}
+
+	select {
+	case <-writer.telemetryDone:
+		writer.telemetryCancel()
+		writer.mutex.Lock()
+		err := writer.telemetryErr
+		writer.mutex.Unlock()
+		return err
+	case <-ctx.Done():
+		writer.telemetryCancel()
+		<-writer.telemetryDone
+		return ctx.Err()
+	}
+}
+
+func (writer *Writer) run() {
+	defer close(writer.done)
+	for {
+		writer.mutex.Lock()
+		if len(writer.queue) == 0 {
+			closed := writer.closed
+			if closed {
+				writer.telemetryClosing = true
+			}
+			writer.mutex.Unlock()
+			if closed {
+				writer.signalTelemetry()
+				return
+			}
+			<-writer.wake
+			continue
+		}
+		item := writer.queue[0]
+		writer.queue[0] = nil
+		writer.queue = writer.queue[1:]
+		if len(writer.queue) == 0 {
+			writer.queue = nil
+		}
+		writer.mutex.Unlock()
+
+		result, err := writer.database.CommitBatch(context.Background(), item.batch)
+		err = classifyCommitError(err)
+		if errors.Is(err, ErrInsufficientStorage) {
+			writer.notifyNoSpace(err)
+		}
+		if err == nil && result.TenancyMismatch && !result.Duplicate {
+			writer.logTenancyMismatch(item.batch)
+		}
+
+		writer.mutex.Lock()
+		writer.queuedBytes -= int64(len(item.canonical))
+		writer.telemetryVersion++
+		writer.mutex.Unlock()
+		writer.signalTelemetry()
+		item.release()
+		item.response <- commitResponse{result: result, err: err}
+	}
+}
+
+type insufficientStorage interface{ InsufficientStorage() bool }
+
+func isInsufficientStorage(err error) bool {
+	var marker insufficientStorage
+	return errors.As(err, &marker) && marker.InsufficientStorage()
+}
+
+func (writer *Writer) notifyNoSpace(err error) {
+	writer.mutex.Lock()
+	hook := writer.noSpaceHook
+	writer.mutex.Unlock()
+	if hook == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hook(ctx, err)
+}
+
+func (writer *Writer) logTenancyMismatch(batch protocol.Batch) {
+	writer.mutex.Lock()
+	logger := writer.tenancyLogger
+	expectedService := writer.expectedService
+	expectedEnvironment := writer.expectedEnvironment
+	writer.mutex.Unlock()
+	if logger == nil {
+		return
+	}
+	logger.Warn("ingest tenancy mismatch",
+		"expected_service", expectedService,
+		"received_service", batch.Service,
+		"expected_environment", expectedEnvironment,
+		"received_environment", batch.Environment,
+	)
+}
+
+func (writer *Writer) publishTelemetry() {
+	defer close(writer.telemetryDone)
+	retryDelay := telemetryRetryMinimum
+	for {
+		select {
+		case <-writer.telemetryWake:
+		case <-writer.telemetryContext.Done():
+			writer.setTelemetryError(writer.telemetryContext.Err())
+			return
+		}
+		for {
+			writer.mutex.Lock()
+			version := writer.telemetryVersion
+			queuedBytes := writer.queuedBytes
+			rejected := writer.pendingRejected
+			closing := writer.telemetryClosing
+			writer.mutex.Unlock()
+
+			queueErr := writer.database.SetQueuedIngestBytes(writer.telemetryContext, queuedBytes)
+			var rejectedErr error
+			if rejected > 0 {
+				rejectedErr = writer.database.AddRejectedBatches(writer.telemetryContext, rejected)
+			}
+			publishErr := errors.Join(queueErr, rejectedErr)
+
+			writer.mutex.Lock()
+			if rejectedErr == nil {
+				writer.pendingRejected -= rejected
+			}
+			changed := writer.telemetryVersion != version
+			closing = closing || writer.telemetryClosing
+			writer.mutex.Unlock()
+
+			if publishErr == nil {
+				retryDelay = telemetryRetryMinimum
+				if closing && !changed {
+					return
+				}
+				if !changed {
+					break
+				}
+				continue
+			}
+			if writer.telemetryContext.Err() != nil {
+				writer.setTelemetryError(writer.telemetryContext.Err())
+				return
+			}
+
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-timer.C:
+			case <-writer.telemetryWake:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-writer.telemetryContext.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				writer.setTelemetryError(writer.telemetryContext.Err())
+				return
+			}
+			if retryDelay < telemetryRetryMaximum/2 {
+				retryDelay *= 2
+			} else {
+				retryDelay = telemetryRetryMaximum
+			}
+		}
+	}
+}
+
+func (writer *Writer) setTelemetryError(err error) {
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+	writer.telemetryErr = fmt.Errorf("flush ingest telemetry: %w", err)
+}
+
+func (writer *Writer) signalTelemetry() {
+	select {
+	case writer.telemetryWake <- struct{}{}:
+	default:
+	}
+}
+
+func classifyCommitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var databaseError *duckdb.Error
+	duckNoSpace := errors.As(err, &databaseError) && databaseError.Type == duckdb.ErrorTypeIO &&
+		strings.Contains(strings.ToLower(databaseError.Msg), "no space left on device")
+	if errors.Is(err, syscall.ENOSPC) || duckNoSpace {
+		return fmt.Errorf("%w: %w", ErrInsufficientStorage, err)
+	}
+	return err
+}

@@ -67,6 +67,16 @@ class JobInstrumentationTest < ActiveJob::TestCase
     assert_equal false, ProbeJob.seen_attrs["job.scheduled"]
   end
 
+  test "records total duration on success" do
+    ProbeJob.perform_now
+    assert_operator @sink.events.first["duration_ms"], :>=, 0.0
+  end
+
+  test "records total duration when the job raises" do
+    assert_raises(ArgumentError) { BoomJob.perform_now }
+    assert_operator @sink.events.first["duration_ms"], :>=, 0.0
+  end
+
   test "performs without a wide event when disabled" do
     WideEvent.configure { |c| c.enabled = false }
     ProbeJob.perform_now
