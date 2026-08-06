@@ -98,6 +98,14 @@ publishes `ghcr.io/adammiribyan/wide-events-store:<version>` and a matching
 tag; the generated accessory pins an exact version, so the tag, the gem's
 `WideEvent::VERSION`, and that pin all have to agree.
 
+Agreement is not existence. Between the tag push and `gem push`,
+`bin/release` blocks on `script/await-store-image <version>`, which watches
+the triggered workflow run and then confirms the manifest is readable. If
+the image never appears, the gem is not published and the script prints the
+exact commands to resume once the workflow is fixed. Run
+`script/await-store-image <version>` by hand to resume, or to check an
+existing release.
+
 ## Ground rules
 
 - Every behavior change ships with tests. The suite is plain Minitest under

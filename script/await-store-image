@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Blocks until ghcr.io/adammiribyan/wide-events-store:<version> actually
+# exists, or fails.
+#
+#   script/await-store-image <version>
+#
+# Pushing a v* tag starts .github/workflows/release-store.yml, which is what
+# publishes the image the gem's generated Kamal accessory pins. Agreement
+# between the tag, WideEvent::VERSION, and that pin (script/verify-release-version)
+# says the three names match; it says nothing about whether the image was
+# ever built. If the workflow fails - an arm64 cgo build, a GHCR outage, a
+# QEMU flake - and the gem ships anyway, every `bin/rails generate
+# wide_events:store` from that release pins an image tag that does not
+# exist, and `kamal setup` fails on the user's machine rather than ours.
+#
+# So bin/release waits here before `gem push`. Re-running this script is
+# safe and is the resume path after a transient failure.
+
+set -eu
+
+VERSION=${1:-}
+IMAGE=${IMAGE:-ghcr.io/adammiribyan/wide-events-store}
+WORKFLOW=${WORKFLOW:-release-store.yml}
+# How long to wait for the tag push to register a workflow run at all.
+RUN_APPEARS_TIMEOUT=${RUN_APPEARS_TIMEOUT:-300}
+
+if [ -z "$VERSION" ]
+then
+  echo "Usage: script/await-store-image <version>" >&2
+  exit 1
+fi
+VERSION=${VERSION#v}
+
+if ! command -v gh >/dev/null 2>&1
+then
+  echo "await-store-image: gh is required to watch the release workflow" >&2
+  exit 1
+fi
+
+echo "await-store-image: waiting for $WORKFLOW on tag v$VERSION"
+
+# Match on the tagged commit when the tag is available locally (it always is
+# from bin/release, and from a manual resume in the same checkout), and on
+# the ref name otherwise. $WORKFLOW only triggers on tags, so scoping the
+# query to it makes a commit-SHA match unambiguous.
+tagged_sha=$(git rev-parse -q --verify "v$VERSION^{commit}" 2>/dev/null || echo "")
+selector=".headBranch == \"v$VERSION\""
+if [ -n "$tagged_sha" ]
+then
+  selector="$selector or .headSha == \"$tagged_sha\""
+fi
+
+run_id=""
+deadline=$(( $(date +%s) + RUN_APPEARS_TIMEOUT ))
+while [ -z "$run_id" ]
+do
+  run_id=$(gh run list --workflow "$WORKFLOW" --limit 20 \
+    --json databaseId,headSha,headBranch \
+    --jq "[.[] | select($selector)] | .[0].databaseId // empty" 2>/dev/null || true)
+  [ -n "$run_id" ] && break
+  if [ "$(date +%s)" -ge "$deadline" ]
+  then
+    echo "await-store-image: no $WORKFLOW run appeared for tag v$VERSION within ${RUN_APPEARS_TIMEOUT}s" >&2
+    exit 1
+  fi
+  sleep 5
+done
+
+echo "await-store-image: watching run $run_id"
+if ! gh run watch "$run_id" --exit-status
+then
+  echo "await-store-image: $WORKFLOW run $run_id failed; $IMAGE:$VERSION was not published" >&2
+  exit 1
+fi
+
+# The workflow succeeding and the manifest being pullable are two different
+# claims. Confirm the second one directly when Docker is available.
+if command -v docker >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1
+then
+  if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1
+  then
+    echo "await-store-image: $IMAGE:$VERSION is published"
+  else
+    echo "await-store-image: $WORKFLOW succeeded but $IMAGE:$VERSION is not readable." >&2
+    echo "await-store-image: if the GHCR package is still private, make it public, then re-run this script." >&2
+    exit 1
+  fi
+else
+  echo "await-store-image: docker buildx unavailable; trusting the workflow result for $IMAGE:$VERSION"
+fi

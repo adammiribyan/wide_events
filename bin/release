@@ -15,7 +15,16 @@ VERSION=${VERSION#v}
 
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null
 then
-  echo "Tag v$VERSION already exists; pick a new version."
+  echo "Tag v$VERSION already exists locally; pick a new version."
+  exit 1
+fi
+
+# A local checkout that has never fetched the tag would happily rewrite
+# version.rb, CHANGELOG.md, and README.md for a version someone already
+# released. Ask the remote before touching anything.
+if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1
+then
+  echo "Tag v$VERSION already exists on origin; pick a new version."
   exit 1
 fi
 
@@ -42,6 +51,30 @@ git tag "v$VERSION"
 # publishes ghcr.io/adammiribyan/wide-events-store:$VERSION - the exact image
 # this gem's store generator pins.
 git push --tags
+
+# The gem must not reach RubyGems before that image exists. Version agreement
+# (checked above) proves the three names match; it does not prove anything
+# was built. A failed workflow plus a published gem means every
+# `bin/rails generate wide_events:store` from this release pins an image tag
+# that isn't there, and the breakage lands on users' `kamal setup`, not here.
+if ! script/await-store-image "$VERSION"
+then
+  cat <<RESUME
+The gem was NOT pushed. v$VERSION is tagged and pushed, but
+ghcr.io/adammiribyan/wide-events-store:$VERSION is not published yet.
+
+Fix the release-store workflow (re-run it from the Actions tab, or push an
+empty commit and re-tag), then finish the release with:
+
+  script/await-store-image $VERSION
+  gem build wide_events.gemspec
+  gem push "wide_events-$VERSION.gem" --host https://rubygems.org
+  gh release create "v$VERSION" "wide_events-$VERSION.gem" --title "v$VERSION" --generate-notes
+  rm "wide_events-$VERSION.gem"
+RESUME
+  exit 1
+fi
+
 gem build wide_events.gemspec
 gem push "wide_events-$VERSION.gem" --host https://rubygems.org
 gh release create "v$VERSION" "wide_events-$VERSION.gem" --title "v$VERSION" --generate-notes

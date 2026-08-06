@@ -162,11 +162,14 @@ class StoreFailureTest < StoreIntegrationTest
 
     # The socket is the only way in: an admin client pointed elsewhere fails
     # rather than opening the database behind the running process's back.
+    before = Dir.glob(File.join(store.directory, "**", "*")).sort
     missing = IO.popen(
       { "WIDE_EVENTS_ADMIN_SOCKET" => File.join(store.directory, "absent.sock") },
       [ StoreIntegration.binary, "admin", "backup" ],
       err: [ :child, :out ], &:read
     )
     refute_equal 0, $?.exitstatus, missing
+    assert_equal before, Dir.glob(File.join(store.directory, "**", "*")).sort,
+                 "a socketless admin client must not touch the database directory"
   end
 end

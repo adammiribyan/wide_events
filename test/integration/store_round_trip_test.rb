@@ -63,7 +63,10 @@ class StoreRoundTripTest < StoreIntegrationTest
 
     assert_equal JOB_EVENTS, store.one_value("SELECT count(*) FROM wide_events WHERE job_class = 'ExportJob'")
     assert_equal 0, store.one_value("SELECT count(*) FROM wide_events WHERE duration_ms IS NULL")
-    assert_equal 0, store.one_value("SELECT count(*) FROM wide_events WHERE service <> 'checkout' OR environment <> 'test'")
+    # Asserted positively: `service <> 'checkout'` is UNKNOWN for a NULL and
+    # would count zero rows whether tenancy was stamped or not.
+    assert_equal total,
+                 store.one_value("SELECT count(*) FROM wide_events WHERE service = 'checkout' AND environment = 'test'")
 
     # The attributes VARIANT survives the round trip with its original types.
     assert_equal true, store.one_value("SELECT attributes.main::BOOLEAN FROM wide_events WHERE kind = 'request' LIMIT 1")
