@@ -1,5 +1,17 @@
 ENV["TZ"] = "UTC"
 
+# The suite reads UTF-8 fixtures and generated files (skills/*/SKILL.md among
+# them) through plain File.read, which tags content with the default external
+# encoding. Under a non-UTF-8 locale (LANG unset in CI containers, cron, or
+# `env -i`) that default is US-ASCII, and every regex match against those
+# bytes raises "invalid byte sequence in US-ASCII". Pin both encodings here so
+# test outcomes never depend on the invoking shell's locale.
+#
+# Only default_external is pinned: that is what tags File.read results, and
+# leaving default_internal nil keeps IO from transcoding, which the integration
+# tests rely on when they move gzip bodies over sockets.
+Encoding.default_external = Encoding::UTF_8
+
 require "active_support"
 require "active_support/test_case"
 require "active_support/core_ext"
