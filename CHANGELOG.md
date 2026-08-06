@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (2026-08-06)
 
 - **A bundled telemetry store.** `bin/rails generate wide_events:store
   --host --hostname --retention-days` writes a Kamal accessory for

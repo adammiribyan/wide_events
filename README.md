@@ -62,7 +62,7 @@ Here's the accessory it adds:
 ```yaml
 accessories:
   wide_events:
-    image: ghcr.io/adammiribyan/wide-events-store:0.1.4
+    image: .2.0
     host: 203.0.113.20
 
     proxy:
