@@ -14,12 +14,26 @@ unless defined?(WideEvent::Tasks::Setup)
   module WideEvent
     module Tasks
       module Setup
-        def self.run(stdout: $stdout, root: default_root)
-          checker = WideEvent::Setup::Checker.new(root: root)
+        # "failed" (a config/Kamal/verification error) and "degraded" (the
+        # store is reachable but actively refusing writes, e.g. low disk
+        # space) are both active faults, so both exit non-zero - a script,
+        # cron, or CI job relying on this exit status must see failure for
+        # either, not just for "failed". "needs_dns" (resumable, expected
+        # while DNS propagates), "ready_to_deploy", and "healthy" are all
+        # informational and exit zero.
+        FAULT_STATES = %w[failed degraded].freeze
+
+        # `checker:` is test-only: it lets the exit-status contract for
+        # each of the five states be pinned down with a fake Checker
+        # (a canned Result), instead of re-deriving all five through a
+        # fully fixtured Checker - that derivation is already covered by
+        # WideEvent::Setup::Checker's own test suite.
+        def self.run(stdout: $stdout, root: default_root, checker: nil)
+          checker ||= WideEvent::Setup::Checker.new(root: root)
           result = checker.run
           stdout.puts "wide_events setup: #{result.state}"
           stdout.puts result.message if result.message && !result.message.empty?
-          abort("wide_events setup check failed - see the message above") if result.state == "failed"
+          abort("wide_events setup check reported #{result.state} - see the message above") if FAULT_STATES.include?(result.state)
         end
 
         def self.default_root

@@ -223,7 +223,54 @@ class TasksTest < ActiveSupport::TestCase
     end
   end
 
+  # Exit-status contract for all five checker states, pinned down against a
+  # fake checker (no real config/deploy.yml, Kamal, DNS, or network involved
+  # - WideEvent::Setup::Checker's own suite covers how each state is
+  # actually derived).
+  [ "needs_dns", "ready_to_deploy", "healthy" ].each do |state|
+    test "setup:check exits zero for the informational state #{state.inspect}" do
+      exit_status = run_setup_check_task(state: state)
+      assert_nil exit_status, "expected no SystemExit for #{state.inspect}"
+    end
+  end
+
+  [ "failed", "degraded" ].each do |state|
+    test "setup:check exits non-zero for the fault state #{state.inspect}" do
+      exit_status = run_setup_check_task(state: state)
+      refute_nil exit_status, "expected a SystemExit for #{state.inspect}"
+      refute exit_status.success?
+    end
+  end
+
   private
+
+  FakeCheckerResult = Struct.new(:state, :checks, :message, keyword_init: true) do
+    def success?
+      state == "healthy"
+    end
+  end
+
+  FakeChecker = Struct.new(:result) do
+    def run
+      result
+    end
+  end
+
+  # Runs WideEvent::Tasks::Setup.run against a fake checker that reports
+  # `state`, capturing stdout so it doesn't leak into the test run, and
+  # returns the SystemExit raised by `abort` (or nil if none was raised).
+  def run_setup_check_task(state:)
+    checker = FakeChecker.new(FakeCheckerResult.new(state: state, checks: {}, message: "fake #{state} message"))
+    exit_status = nil
+    capture_io do
+      begin
+        WideEvent::Tasks::Setup.run(checker: checker)
+      rescue SystemExit => e
+        exit_status = e
+      end
+    end
+    exit_status
+  end
 
   def query_json(columns: [ "value" ], rows: [ [ 1 ] ], truncated: false)
     { columns: columns, rows: rows, truncated: truncated }.to_json

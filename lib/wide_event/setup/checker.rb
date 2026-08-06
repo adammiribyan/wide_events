@@ -98,7 +98,7 @@ module WideEvent
 
         dns = check_dns(config)
         checks[:dns] = dns[:ok]
-        return build_result("needs_dns", checks, dns[:message]) unless dns[:ok]
+        return build_result(dns[:state], checks, dns[:message]) unless dns[:ok]
 
         endpoint = check_endpoint(config)
         checks[:endpoint] = endpoint[:state] == :healthy
@@ -206,14 +206,25 @@ module WideEvent
 
       # ---- DNS ---------------------------------------------------------------
 
-      # Polls every DNS_POLL_INTERVAL_SECONDS for up to DNS_TIMEOUT_SECONDS
-      # monotonic seconds. Generated files are never touched here - a
-      # timeout only ever returns "needs_dns" with the record still needed
-      # and the exact resume command, never reverts anything.
+      # Two different failure modes here, deliberately kept distinct:
+      #
+      # - The *store host* (the SSH address recorded by the store generator)
+      #   doesn't resolve at all. That is a config error - a mistyped
+      #   address never starts resolving no matter how long you wait - so it
+      #   is "failed", not resumable, and points at the host setting.
+      # - The *telemetry hostname* hasn't propagated to point at the store
+      #   host yet. That is expected and resumable, so a timeout here (after
+      #   polling every DNS_POLL_INTERVAL_SECONDS for up to
+      #   DNS_TIMEOUT_SECONDS monotonic seconds) is "needs_dns" with the
+      #   record still needed and the exact resume command. Generated files
+      #   are never touched in either case.
       def check_dns(config)
         target_addresses = resolve_target_addresses(config[:host])
         if target_addresses.empty?
-          return { ok: false, message: "could not resolve the store host #{config[:host]} to an address" }
+          return { ok: false, state: "failed",
+                    message: "could not resolve the store host #{config[:host]} to an address - " \
+                      "check the host set on the wide_events accessory in config/deploy.yml " \
+                      "(re-run `bin/rails generate wide_events:store --host=...` if it's wrong)" }
         end
 
         started = @clock.call
@@ -223,7 +234,7 @@ module WideEvent
 
           elapsed = @clock.call - started
           if elapsed >= DNS_TIMEOUT_SECONDS
-            return { ok: false, message: dns_timeout_message(config, target_addresses) }
+            return { ok: false, state: "needs_dns", message: dns_timeout_message(config, target_addresses) }
           end
 
           @sleeper.call(DNS_POLL_INTERVAL_SECONDS)

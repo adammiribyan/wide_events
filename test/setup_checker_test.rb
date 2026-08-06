@@ -33,6 +33,31 @@ class SetupCheckerTest < ActiveSupport::TestCase
     refute checker.run.success?
   end
 
+  # ---- DNS: two distinct failure modes --------------------------------------
+
+  test "a genuine DNS-propagation timeout is needs_dns, not failed, once the store host itself resolves" do
+    checker = build_checker(resolver: always_missing, clock: fake_clock, sleeper: advancing_sleeper)
+    result = checker.run
+    assert_equal "needs_dns", result.state
+  end
+
+  test "fails with a config error (not needs_dns) when the store host itself cannot be resolved" do
+    # A mistyped SSH address/hostname in config/deploy.yml never starts
+    # resolving no matter how long the caller waits, so this must not be
+    # confused with (or advise retrying like) a genuine DNS-propagation
+    # timeout: it is a config error, so it must be "failed", must not
+    # mention resuming, and must name the offending host.
+    root = make_root(host: "typo-host.example.invalid")
+    checker = build_checker(root: root, resolver: ->(_hostname) { [] })
+    result = checker.run
+
+    assert_equal "failed", result.state
+    assert_equal false, result.checks[:dns]
+    assert_match(/typo-host\.example\.invalid/, result.message)
+    assert_match(/config\/deploy\.yml/, result.message)
+    refute_match(/setup:check/, result.message)
+  end
+
   # ---- failed: Kamal version/config/directory preflights -------------------
 
   test "fails and prints an upgrade instruction when the installed kamal is older than the minimum version" do
