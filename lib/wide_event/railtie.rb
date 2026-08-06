@@ -42,6 +42,7 @@ module WideEvent
     rake_tasks do
       load File.expand_path("tasks/registry.rake", __dir__)
       load File.expand_path("tasks/store.rake", __dir__)
+      load File.expand_path("tasks/setup.rake", __dir__)
     end
   end
 end

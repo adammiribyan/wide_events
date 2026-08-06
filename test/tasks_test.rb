@@ -16,6 +16,7 @@ require "json"
 # NameError. Loading it once here, at file-load time, guarantees the
 # module exists before any test in this file runs, regardless of order.
 load File.expand_path("../lib/wide_event/tasks/store.rake", __dir__)
+load File.expand_path("../lib/wide_event/tasks/setup.rake", __dir__)
 
 class TasksTest < ActiveSupport::TestCase
   QUERY_TOKEN = "test-query-token"
@@ -26,6 +27,7 @@ class TasksTest < ActiveSupport::TestCase
     Rake::Task.define_task(:environment)
     load File.expand_path("../lib/wide_event/tasks/registry.rake", __dir__)
     load File.expand_path("../lib/wide_event/tasks/store.rake", __dir__)
+    load File.expand_path("../lib/wide_event/tasks/setup.rake", __dir__)
     yield rake
   end
 
@@ -188,6 +190,36 @@ class TasksTest < ActiveSupport::TestCase
         capture_io { invoke_store_task(stdin: StringIO.new("DELETE FROM wide_events")) }
       end
       refute error.success?
+    end
+  end
+
+  # --- wide_events:setup:check ---
+
+  test "setup:check is registered under the wide_events namespace" do
+    with_rake do |rake|
+      assert_includes rake.tasks.map(&:name), "wide_events:setup:check"
+    end
+  end
+
+  test "setup:check aborts with guidance when config/deploy.yml has not been generated yet" do
+    # A bare Checker (real runner/resolver/etc.) is safe here: with no
+    # config/deploy.yml under `root`, WideEvent::Setup::Checker fails before
+    # ever shelling out to `kamal` or touching the network - so this
+    # exercises the task's abort/exit-status wiring without needing any of
+    # the injected doubles the checker's own test suite uses.
+    Dir.mktmpdir do |dir|
+      error = nil
+      stdout, = capture_io do
+        begin
+          WideEvent::Tasks::Setup.run(root: dir)
+        rescue SystemExit => e
+          error = e
+        end
+      end
+      refute_nil error, "expected the task to abort (raise SystemExit)"
+      refute error.success?
+      assert_match(%r{config/deploy\.yml}, stdout)
+      assert_match(/failed/, stdout)
     end
   end
 
