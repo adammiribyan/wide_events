@@ -133,6 +133,36 @@ class StoreSenderTest < ActiveSupport::TestCase
     assert_equal 0, sender.pending_drops
   end
 
+  # The sealing loop budgets event bytes only, but the store measures the
+  # entire canonical batch document - protocol_version, ids, service,
+  # environment, the loss report, the commas between events - against the very
+  # same 1 MiB cap. A batch that overshoots there is answered 400, which is a
+  # permanent error: the sender drops all hundred events and reports nothing,
+  # because the loss counters only cover what the queue itself shed.
+  test "a sealed batch's whole wire document fits the byte cap the store enforces" do
+    recorder = recording_client
+    sender = build_sender(client: recorder, autostart: false,
+                           max_queue_events: 1000, max_queue_bytes: 16 * 1024 * 1024,
+                           max_compressed_bytes: 64 * 1024 * 1024)
+
+    # Queue events whose bytes sum to *exactly* the cap, so an accounting that
+    # ignores the envelope produces a document one envelope over the line.
+    limit = WideEvent::Store::Sender::MAX_BATCH_BYTES
+    overhead = event_json("").bytesize
+    sized = ->(bytes) { event_json("x" * (bytes - overhead)) }
+    20.times { sender.enqueue(sized.call(50_000)) }
+    sender.enqueue(sized.call(limit - 20 * 50_000))
+
+    sender.flush_once
+    assert_equal 1, recorder.calls.length
+    wire = Zlib.gunzip(recorder.calls.first)
+
+    assert_operator wire.bytesize, :<=, limit,
+                    "the store charges this entire document, envelope included, against the same cap"
+    assert_operator wire.bytesize, :>, limit - 60_000,
+                    "the envelope reserve must not be so large that batches stop filling"
+  end
+
   test "shutdown drains the queue within the timeout and stops the worker thread" do
     sender = build_sender(client: scripted_client(:ok, :ok, :ok), max_queue_events: 10, max_batch_events: 1)
     3.times { |i| sender.enqueue(event_json("e#{i}")) }

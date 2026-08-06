@@ -78,6 +78,42 @@ class StoreRoundTripTest < StoreIntegrationTest
     assert_equal [ 1, true, total, "0.0.0-integration" ], status.rows.first
   end
 
+  # The client and the server must charge the same bytes for the same event.
+  # Ruby measures its own JSON.generate output against 64 KiB; the store
+  # re-encodes the decoded event and measures that. While the store's encoder
+  # HTML-escaped, every & and < cost one byte on the client and six on the
+  # server, so an event the client had just measured as legal came back 400 -
+  # a permanent error that makes the sender drop the whole batch, with no loss
+  # report and nothing in the data to show for it. This pins the seam shut at
+  # the exact boundary, with the characters that used to inflate.
+  test "an event sized to the client's limit with an &-and-< dense payload is accepted whole" do
+    store = start_store
+    sender, sink = build_host("web-1", url: store.url)
+
+    base = request_event(controller: "search#index")
+    sized = lambda do |payload|
+      WideEvent::Store::Envelope.build(
+        base.merge("http.query" => payload),
+        clock: -> { Time.now }, uuid: -> { SecureRandom.uuid }, env: { "HOSTNAME" => "web-1" }
+      ).bytesize
+    end
+
+    room = WideEvent::Store::Envelope::MAX_EVENT_BYTES - sized.call("")
+    payload = "&<" * (room / 2)
+    payload += "&" if room.odd?
+    assert_equal WideEvent::Store::Envelope::MAX_EVENT_BYTES, sized.call(payload),
+                 "the event must sit exactly on the client's limit for this to test the boundary"
+
+    sink.flush(base.merge("http.query" => payload))
+    sender.shutdown(timeout: SHUTDOWN_TIMEOUT)
+
+    assert_equal 1, store.one_value("SELECT count(*) FROM wide_events"),
+                 "a maximum-size event dense with & and < must be accepted, not 400ed away"
+    assert_equal payload,
+                 store.one_value("SELECT attributes['http.query']::VARCHAR FROM wide_events"),
+                 "the payload must survive both runtimes' JSON encoders byte for byte"
+  end
+
   test "an already-committed batch id is acknowledged as a duplicate instead of stored twice" do
     store = start_store
     client = store.client

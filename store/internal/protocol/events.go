@@ -2,6 +2,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,7 +116,7 @@ func DecodeBatch(reader io.Reader) (Batch, []byte, error) {
 	if err := validateBatch(&batch); err != nil {
 		return Batch{}, nil, err
 	}
-	canonical, err := json.Marshal(batch)
+	canonical, err := canonicalJSON(batch)
 	if err != nil {
 		return Batch{}, nil, fmt.Errorf("marshal canonical batch: %w", err)
 	}
@@ -182,7 +183,7 @@ func validateEvent(event *Event) error {
 		}
 		event.Attributes[key] = primitive
 	}
-	canonical, err := json.Marshal(event)
+	canonical, err := canonicalJSON(event)
 	if err != nil {
 		return validation("event", ErrInvalidEvent)
 	}
@@ -190,6 +191,33 @@ func validateEvent(event *Event) error {
 		return validation("event", ErrEventTooLarge)
 	}
 	return nil
+}
+
+// canonicalJSON encodes value the way the Ruby sender encodes it, so both
+// runtimes measure the same bytes against MaxEventBytes and MaxBatchBytes.
+//
+// json.Marshal escapes &, < and > as six-byte \u00XX sequences; Ruby's
+// JSON.generate emits them literally. An event the client measured at just
+// under 64 KiB could therefore inflate past the limit here purely from
+// ampersands, and the resulting 400 is a permanent error that makes the Ruby
+// sender drop the whole batch - silent, invisible loss that no amount of
+// client-side care could avoid. Disabling HTML escaping removes the seam.
+//
+// (encoding/json still escapes U+2028 and U+2029 unconditionally, which
+// SetEscapeHTML cannot turn off. Those two characters remain a three-byte
+// versus six-byte asymmetry; they are vanishingly rare in event attributes
+// and would need over ten thousand of them in one event to matter.)
+func canonicalJSON(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	// Encode always terminates the document with a newline; the canonical
+	// bytes are the document itself, both for the size checks here and for
+	// the writer queue's byte accounting.
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 func normalizeAttribute(value any) (any, error) {

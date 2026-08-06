@@ -232,7 +232,7 @@ func TestDecodeBatchAcceptsExactlyMaximumEventBytes(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		canonicalEvent, err := json.Marshal(decoded.Events[0])
+		canonicalEvent, err := canonicalJSON(decoded.Events[0])
 		require.NoError(t, err)
 		if len(canonicalEvent) == MaxEventBytes {
 			assert.NoError(t, err)
@@ -247,6 +247,93 @@ func TestDecodeBatchRejectsOneByteBeyondMaximumEventBytes(t *testing.T) {
 	batch["events"].([]any)[0].(map[string]any)["attributes"] = map[string]any{"payload": strings.Repeat("x", MaxEventBytes)}
 	_, _, err := DecodeBatch(strings.NewReader(marshalJSON(t, batch)))
 	assert.Error(t, err)
+}
+
+// The Ruby sender measures its own JSON.generate output against the same
+// MaxEventBytes/MaxBatchBytes constants. json.Marshal's default HTML escaping
+// would turn each &, < and > into six bytes here but one byte there, so an
+// ampersand-dense event the client considered legal would be rejected with a
+// 400 - a permanent error that drops the entire batch. Canonical bytes must
+// therefore count these characters exactly as Ruby does.
+func TestCanonicalBytesLeaveHTMLCharactersUnescaped(t *testing.T) {
+	batch := validBatch()
+	batch["events"].([]any)[0].(map[string]any)["attributes"] = map[string]any{
+		"http.route": "/search?q=a&b<c>d",
+	}
+
+	_, canonical, err := DecodeBatch(strings.NewReader(marshalJSON(t, batch)))
+	require.NoError(t, err)
+	assert.Contains(t, string(canonical), `/search?q=a&b<c>d`)
+	for _, escaped := range []string{`\u0026`, `\u003c`, `\u003e`} {
+		assert.NotContains(t, string(canonical), escaped, "canonical bytes must not HTML-escape")
+	}
+}
+
+func TestDecodeBatchChargesHTMLCharactersOneByteEachAtTheEventBoundary(t *testing.T) {
+	// Every one of these ampersands cost six canonical bytes under the old
+	// HTML-escaping encoder, so an event Ruby measured at exactly 64 KiB
+	// arrived here as 384 KiB and was rejected. Size the payload from the
+	// empty-payload overhead: if a & is charged as one byte, that lands the
+	// canonical event exactly on the limit.
+	eventWithAmpersands := func(payloadBytes int) string {
+		batch := validBatch()
+		batch["events"].([]any)[0].(map[string]any)["attributes"] = map[string]any{
+			"payload": strings.Repeat("&", payloadBytes),
+		}
+		return marshalJSON(t, batch)
+	}
+
+	empty, _, err := DecodeBatch(strings.NewReader(eventWithAmpersands(0)))
+	require.NoError(t, err)
+	overhead, err := canonicalJSON(empty.Events[0])
+	require.NoError(t, err)
+
+	decoded, _, err := DecodeBatch(strings.NewReader(eventWithAmpersands(MaxEventBytes - len(overhead))))
+	require.NoError(t, err)
+	canonicalEvent, err := canonicalJSON(decoded.Events[0])
+	require.NoError(t, err)
+	assert.Len(t, canonicalEvent, MaxEventBytes)
+
+	_, _, err = DecodeBatch(strings.NewReader(eventWithAmpersands(MaxEventBytes - len(overhead) + 1)))
+	assert.ErrorIs(t, err, ErrEventTooLarge)
+}
+
+func TestDecodeBatchChargesHTMLCharactersOneByteEachAtTheBatchBoundary(t *testing.T) {
+	// A single event caps at 64 KiB, so filling a 1 MiB batch with angle
+	// brackets takes the full hundred events. The request body is encoded the
+	// way the Ruby sender encodes it (unescaped); escaping it here would blow
+	// past MaxDecodedBodyBytes long before the batch limit came into play.
+	batchWithAngleBrackets := func(t *testing.T, extraBytes int) string {
+		t.Helper()
+		batch := validBatch()
+		events := repeatedEvents(MaxEvents)
+		batch["events"] = events
+		for _, value := range events {
+			value.(map[string]any)["attributes"] = map[string]any{"payload": ""}
+		}
+		empty, err := canonicalJSON(batch)
+		require.NoError(t, err)
+
+		remaining := MaxBatchBytes - len(empty) + extraBytes
+		require.Positive(t, remaining)
+		for index, value := range events {
+			payloadBytes := remaining / len(events)
+			if index < remaining%len(events) {
+				payloadBytes++
+			}
+			value.(map[string]any)["attributes"] = map[string]any{"payload": strings.Repeat("<", payloadBytes)}
+		}
+		encoded, err := canonicalJSON(batch)
+		require.NoError(t, err)
+		return string(encoded)
+	}
+
+	_, canonical, err := DecodeBatch(strings.NewReader(batchWithAngleBrackets(t, 0)))
+	require.NoError(t, err)
+	assert.Len(t, canonical, MaxBatchBytes)
+
+	_, _, err = DecodeBatch(strings.NewReader(batchWithAngleBrackets(t, 1)))
+	assert.ErrorIs(t, err, ErrBatchTooLarge)
 }
 
 func TestDecodeBatchReturnsNoCanonicalBytesOnValidationFailure(t *testing.T) {

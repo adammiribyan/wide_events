@@ -56,6 +56,7 @@ module WideEvent
         @uuid = uuid
         @process_id = process_id
         @autostart = autostart
+        @max_event_bytes_per_batch = [ max_batch_bytes - envelope_overhead_bytes, 1 ].max
 
         @mutex = Mutex.new
         @cv = ConditionVariable.new
@@ -296,7 +297,7 @@ module WideEvent
       def seal_ready_locked?
         return false if @queue.empty?
         return true if @queue.length >= @max_batch_events
-        return true if @queue_bytes >= @max_batch_bytes
+        return true if @queue_bytes >= @max_event_bytes_per_batch
         @queue_started_at && (@clock.call - @queue_started_at) >= @flush_interval
       end
 
@@ -307,7 +308,7 @@ module WideEvent
         bytes = 0
         while !@queue.empty? && events.length < @max_batch_events
           candidate_bytes = @queue.first.bytesize
-          break if events.any? && bytes + candidate_bytes > @max_batch_bytes
+          break if events.any? && bytes + candidate_bytes > @max_event_bytes_per_batch
           events << @queue.shift
           bytes += candidate_bytes
           @queue_bytes -= candidate_bytes
@@ -326,6 +327,28 @@ module WideEvent
         mid = events.length / 2
         split_into_wire_batches(events[0...mid], drop_count, loss_report_id) +
           split_into_wire_batches(events[mid..], 0, nil)
+      end
+
+      # The store measures the whole canonical batch document against the same
+      # 1 MiB cap that the sealing loop applies to the sum of event bytes
+      # alone, so everything wrapped around those events has to come out of
+      # the same budget. Without that reserve a batch this sender considers
+      # legal can come back 400 - a permanent error, which drops the entire
+      # batch and reports nothing, since the loss counters only cover events
+      # the queue itself shed. Sized for the envelope at its largest: every
+      # fixed key present, 36-character batch and loss-report ids, a
+      # saturated drop count, and one separating comma per event.
+      def envelope_overhead_bytes
+        JSON.generate(
+          "protocol_version" => 1,
+          "batch_id" => "0" * 36,
+          "service" => @service,
+          "environment" => @environment,
+          "sent_at" => Time.now.utc.iso8601(3),
+          "dropped_events_since_last_batch" => (2**64) - 1,
+          "loss_report_id" => "0" * 36,
+          "events" => []
+        ).bytesize + @max_batch_events
       end
 
       def build_wire_batch(events, drop_count, loss_report_id)
