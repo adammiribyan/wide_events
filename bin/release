@@ -11,15 +11,36 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+VERSION=${VERSION#v}
+
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null
+then
+  echo "Tag v$VERSION already exists; pick a new version."
+  exit 1
+fi
+
 printf "module WideEvent\n  VERSION = \"%s\"\nend\n" "$VERSION" > lib/wide_event/version.rb
 if grep -q '^## Unreleased' CHANGELOG.md; then
   perl -pi -e "s/^## Unreleased/## v$VERSION ($(date +%Y-%m-%d))/" CHANGELOG.md
 fi
+# The README shows the generated accessory verbatim, pinned image and all.
+perl -pi -e "s{(ghcr\.io/adammiribyan/wide-events-store:)[0-9][^\s\`]*}{\$1$VERSION}g" README.md
+
+# Nothing below this line is reversible once pushed, and pushing a tag the
+# store image will not be published under (or a gem whose generated Kamal
+# accessory pins an image tag that does not exist) is the one mistake that
+# breaks a host app's `kamal setup` rather than just this repository.
+script/verify-release-version "$VERSION"
+script/check-gem-contents
+
 bundle
-git add Gemfile.lock lib/wide_event/version.rb CHANGELOG.md
+git add Gemfile.lock lib/wide_event/version.rb CHANGELOG.md README.md
 git commit -m "Bump version for $VERSION"
 git push
 git tag "v$VERSION"
+# Pushing the tag is what triggers .github/workflows/release-store.yml, which
+# publishes ghcr.io/adammiribyan/wide-events-store:$VERSION - the exact image
+# this gem's store generator pins.
 git push --tags
 gem build wide_events.gemspec
 gem push "wide_events-$VERSION.gem" --host https://rubygems.org

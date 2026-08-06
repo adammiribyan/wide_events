@@ -1,0 +1,46 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Release agreement gate: `script/verify-release-version <version>`
+#
+# A published store image is only reachable if the tag the release workflow
+# builds, the gem's WideEvent::VERSION, and the image pin the Kamal generator
+# writes into a host app's config/deploy.yml are all the same string. Nothing
+# in the system notices a drift between them until someone runs
+# `kamal setup` against a tag that was never pushed, so both bin/release and
+# .github/workflows/release-store.yml run this before anything is published.
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift(File.join(ROOT, "lib"))
+require "wide_event/version"
+require "wide_event/kamal/deploy_editor"
+
+def die(message)
+  warn "verify-release-version: #{message}"
+  exit 1
+end
+
+version = ARGV.first.to_s.sub(/\Av/, "")
+die("usage: script/verify-release-version <version>") if version.empty?
+
+if version != WideEvent::VERSION
+  die("release version #{version} does not match WideEvent::VERSION #{WideEvent::VERSION}")
+end
+
+rendered = WideEvent::Kamal::DeployEditor.new(
+  "service: myapp\n",
+  service: "myapp",
+  host: "203.0.113.20",
+  hostname: "telemetry.example.com"
+).apply
+die("the store generator refused to render an accessory: #{rendered.conflicts.inspect}") if rendered.conflicts.any?
+
+expected = "image: ghcr.io/adammiribyan/wide-events-store:#{version}"
+unless rendered.content.include?(expected)
+  die("the generated accessory does not pin #{expected}")
+end
+if rendered.content.include?("wide-events-store:latest")
+  die("the generated accessory pins a moving `latest` tag")
+end
+
+puts "verify-release-version: v#{version}, WideEvent::VERSION, and the generated image pin agree"

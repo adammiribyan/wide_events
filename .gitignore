@@ -5,3 +5,4 @@
 /.worktrees/
 /gemfiles/*.gemfile.lock
 *.gem
+/store/wide-events

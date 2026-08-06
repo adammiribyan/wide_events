@@ -1,0 +1,101 @@
+# BEGIN wide_events store
+minimum_version: 2.10.0
+# END wide_events store
+
+# Name of your application. Used to uniquely configure containers.
+service: myapp
+
+# Name of the container image.
+image: my-user/myapp
+
+# Deploy to these servers.
+servers:
+  web:
+    - 192.168.0.1
+
+# Enable SSL auto certification via Let's Encrypt.
+proxy:
+  ssl: true
+  host: app.example.com
+
+# Credentials for your image host.
+registry:
+  username: my-user
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# Inject ENV variables into containers (secrets come from .kamal/secrets).
+env:
+  secret:
+    - RAILS_MASTER_KEY
+    # BEGIN wide_events store
+    - WIDE_EVENTS_INGEST_TOKEN
+    - WIDE_EVENTS_QUERY_TOKEN
+    # END wide_events store
+  # BEGIN wide_events store
+  clear:
+    WIDE_EVENTS_URL: https://telemetry.example.com
+    WIDE_EVENTS_SERVICE: myapp
+    WIDE_EVENTS_ENVIRONMENT: production
+  # END wide_events store
+
+# Aliases are triggered with "bin/kamal <alias>".
+aliases:
+  console: app exec --interactive --reuse "bin/rails console"
+  shell: app exec --interactive --reuse "bash"
+  logs: app logs -f
+  # BEGIN wide_events store
+  telemetry: app exec -i --reuse "bin/rails wide_events:sql"
+  wide-events-backup: accessory exec wide_events "wide-events admin backup"
+  # END wide_events store
+
+# Use a persistent storage volume for local files.
+volumes:
+  - "myapp_storage:/rails/storage"
+
+# Configure the image builder.
+builder:
+  arch: amd64
+
+# Uncomment to add an accessory later.
+# accessories:
+#   db:
+#     image: mysql:8.0
+#     host: 192.168.0.2
+
+accessories:
+  # BEGIN wide_events store
+  wide_events:
+    image: ghcr.io/adammiribyan/wide-events-store:0.1.4
+    host: 203.0.113.20
+
+    proxy:
+      host: telemetry.example.com
+      ssl: true
+      app_port: 7421
+      healthcheck:
+        path: /up
+        interval: 3
+        timeout: 3
+
+    env:
+      clear:
+        WIDE_EVENTS_LISTEN: 0.0.0.0:7421
+        WIDE_EVENTS_DATABASE: /var/lib/wide-events/events.duckdb
+        WIDE_EVENTS_SERVICE: myapp
+        WIDE_EVENTS_ENVIRONMENT: production
+        WIDE_EVENTS_RETENTION_DAYS: 30
+      secret:
+        - WIDE_EVENTS_INGEST_TOKEN
+        - WIDE_EVENTS_QUERY_TOKEN
+
+    directories:
+      - local: /var/lib/myapp-wide-events
+        remote: /var/lib/wide-events
+        mode: "0750"
+        owner: "1000:1000"
+
+    options:
+      cpus: 2
+      memory: 2g
+  # END wide_events store

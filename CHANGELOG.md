@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+- **A bundled telemetry store.** `bin/rails generate wide_events:store
+  --host --hostname --retention-days` writes a Kamal accessory for
+  `ghcr.io/adammiribyan/wide-events-store:<version>`, a single-process Go
+  service around DuckDB, plus durable ingest and query tokens under
+  `.kamal/`. `kamal setup` deploys it and `kamal telemetry` opens a SQL
+  prompt against production. No collector and no OpenTelemetry SDK
+  required; `:otel` and `:log` keep working unchanged.
+- The `:store` sink batches, gzips, and delivers events on one background
+  thread per process, behind a bounded queue (1,000 events or 8 MiB) that
+  drops oldest-first and reports the count with the next batch. Batches are
+  idempotent by `batch_id`, so a response lost after the store committed is
+  retried and deduplicated instead of double-counted. The sender is
+  fork-aware.
+- `WIDE_EVENTS_URL` alone enables the gem and selects the store sink,
+  ahead of `OTEL_EXPORTER_OTLP_ENDPOINT`. `WIDE_EVENTS_SERVICE`,
+  `WIDE_EVENTS_ENVIRONMENT`, `WIDE_EVENTS_INGEST_TOKEN`, and
+  `WIDE_EVENTS_QUERY_TOKEN` complete the configuration; ingest and query
+  tokens must differ.
+- The store keeps `route`, `job_class`, `status`, `error`, `request_id`,
+  `duration_ms`, `kind`, `deployment`, and `source` as real columns and
+  everything else in an `attributes` VARIANT, read as
+  `attributes['key.name']::VARCHAR`. `wide_events_store_status` is the
+  one-row operational view. Queries are read-only and bounded: 2 running,
+  4 waiting, 15s, 10,000 rows, 10 MiB.
+- Retention deletes events past `WIDE_EVENTS_RETENTION_DAYS` daily, a
+  verified local backup runs alongside it (three newest kept, or on demand
+  via `kamal wide-events-backup`), and the store reserves the greater of
+  2 GiB or 10% of the volume as a write floor. Below it, ingest answers 507
+  while `/up` and queries keep working.
+- `bin/rails wide_events:setup:check` is the idempotent resume command for
+  the whole setup: Kamal version and config, host directory permissions,
+  DNS, and a synthetic round trip through the deployed endpoint.
+- A third bundled skill, `setting-up-wide-events-store`, walks an agent
+  through the deploy. `debugging-with-wide-events` gained the store's data
+  model and standing queries.
+- The generated accessory raises `minimum_version` to `2.10.0`: its
+  structured `directories` entry carries the `mode` and `owner` the DuckDB
+  volume needs, and older Kamal releases reject it.
+
 ## v0.1.4 (2026-08-04)
 
 - The railtie stores `registry_path` relative to the app root

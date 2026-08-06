@@ -16,10 +16,14 @@ never needs child spans: filter `main = true` and aggregate.
 - **Wide Events store (bundled DuckDB accessory):** the `wide_events` table.
   `route`, `job_class`, `status`, `error`, `request_id`, `duration_ms`,
   `kind`, `deployment`, and `source` are promoted columns; everything else
-  the app set is in the `attributes` JSON column, read with `attributes->>
-  'key.name'`. Query it with `kamal telemetry` (an interactive prompt, or
-  pipe SQL to it non-interactively) - never SSH in and open the database
-  file directly.
+  the app set is in the `attributes` VARIANT column, read with
+  `attributes['key.name']`. A VARIANT cannot be returned as-is, so cast it
+  to the type you want: `attributes['exception.type']::VARCHAR`,
+  `attributes['account.id']::BIGINT`,
+  `attributes['feature_flag.new_ui']::BOOLEAN`. `IS NULL` works without a
+  cast. Query it with `kamal telemetry` (an interactive prompt, or pipe SQL
+  to it non-interactively) - never SSH in and open the database file
+  directly.
 - **ClickHouse (HyperDX/ClickStack default schema):** the `otel_traces`
   table; wide-event attributes are in the `SpanAttributes` map, resource
   attributes (build, host, environment) in `ResourceAttributes`. Adapt table
@@ -72,10 +76,10 @@ ORDER BY failures DESC
 standing "instrument this rescue" query (see instrumenting-wide-events):
 
 ```sql
-SELECT route, job_class, attributes->>'exception.type' AS exception_type, count(*) AS occurrences
+SELECT route, job_class, attributes['exception.type']::VARCHAR AS exception_type, count(*) AS occurrences
 FROM wide_events
 WHERE error
-  AND (attributes->>'exception.slug' IS NULL OR attributes->>'exception.slug' = '')
+  AND coalesce(attributes['exception.slug']::VARCHAR, '') = ''
   AND occurred_at > current_timestamp - INTERVAL 1 DAY
 GROUP BY route, job_class, exception_type
 ORDER BY occurrences DESC

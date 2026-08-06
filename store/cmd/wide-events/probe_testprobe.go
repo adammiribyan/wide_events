@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,10 +14,34 @@ import (
 	"github.com/adammiribyan/wide_events/store/internal/storage"
 )
 
+const (
+	defaultProbeTotalBytes = int64(50 << 30)
+	defaultProbeFreeBytes  = int64(20 << 30)
+)
+
 type deterministicProbe struct{}
 
+// Space reports a fixed 50 GiB volume with 20 GiB free so integration tests
+// never inherit the host's real capacity. WIDE_EVENTS_TESTPROBE_TOTAL_BYTES
+// and WIDE_EVENTS_TESTPROBE_FREE_BYTES override either figure, which is how
+// a test drives the store below its write floor and asserts the 507 path.
 func (deterministicProbe) Space(string) (disk.Space, error) {
-	return disk.Space{Total: 50 << 30, Free: 20 << 30}, nil
+	return disk.Space{
+		Total: probeBytes("WIDE_EVENTS_TESTPROBE_TOTAL_BYTES", defaultProbeTotalBytes),
+		Free:  probeBytes("WIDE_EVENTS_TESTPROBE_FREE_BYTES", defaultProbeFreeBytes),
+	}, nil
+}
+
+func probeBytes(name string, fallback int64) int64 {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func processProbe() disk.Probe { return deterministicProbe{} }
