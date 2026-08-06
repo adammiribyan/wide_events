@@ -14,7 +14,6 @@ const (
 	defaultAdminSocket        = "/run/wide-events/admin.sock"
 	defaultRetentionDays      = 30
 	defaultWriterQueueBytes   = int64(32 << 20)
-	defaultFreeFloorBytes     = int64(2 << 30)
 	defaultQueryTempBytes     = int64(4 << 30)
 	defaultQueryActive        = 2
 	defaultQueryWaiting       = 4
@@ -24,12 +23,16 @@ const (
 )
 
 // Config is the validated runtime configuration for a single store process.
+//
+// The disk write floor is deliberately absent: it is fixed in package disk
+// (the greater of 2 GiB and 10% of the volume) precisely so no environment
+// variable can weaken the one limit that keeps a full volume recoverable.
 type Config struct {
-	Listen, Database, Service, Environment           string
-	IngestToken, QueryToken, AdminSocket             string
-	RetentionDays, QueryActive, QueryWaiting         int
-	WriterQueueBytes, FreeFloorBytes, QueryTempBytes int64
-	QueryTimeout, QueryWaitTimeout                   time.Duration
+	Listen, Database, Service, Environment   string
+	IngestToken, QueryToken, AdminSocket     string
+	RetentionDays, QueryActive, QueryWaiting int
+	WriterQueueBytes, QueryTempBytes         int64
+	QueryTimeout, QueryWaitTimeout           time.Duration
 }
 
 // Load reads and validates configuration using getenv. Supplying getenv keeps
@@ -45,7 +48,6 @@ func Load(getenv func(string) string) (Config, error) {
 		AdminSocket:      valueOr(getenv("WIDE_EVENTS_ADMIN_SOCKET"), defaultAdminSocket),
 		RetentionDays:    defaultRetentionDays,
 		WriterQueueBytes: defaultWriterQueueBytes,
-		FreeFloorBytes:   defaultFreeFloorBytes,
 		QueryTempBytes:   defaultQueryTempBytes,
 		QueryActive:      defaultQueryActive,
 		QueryWaiting:     defaultQueryWaiting,
@@ -71,9 +73,6 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.WriterQueueBytes, err = positiveInt64(getenv, "WIDE_EVENTS_WRITER_QUEUE_BYTES", cfg.WriterQueueBytes); err != nil {
-		return Config{}, err
-	}
-	if cfg.FreeFloorBytes, err = positiveInt64(getenv, "WIDE_EVENTS_FREE_FLOOR_BYTES", cfg.FreeFloorBytes); err != nil {
 		return Config{}, err
 	}
 	if cfg.QueryTempBytes, err = positiveInt64(getenv, "WIDE_EVENTS_QUERY_TEMP_BYTES", cfg.QueryTempBytes); err != nil {
